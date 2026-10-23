@@ -1,0 +1,334 @@
+package com.nlx.music
+
+import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.unit.dp
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.compose.currentBackStackEntryAsState
+import androidx.navigation.compose.rememberNavController
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.nlx.music.util.AppLocaleManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
+import com.nlx.music.data.repository.LastFmAuthCallbackCoordinator
+import com.nlx.music.ui.navigation.NlxMusicNavHost
+import com.nlx.music.ui.navigation.Screen
+import com.nlx.music.ui.player.PlayerHost
+import com.nlx.music.ui.theme.NlxMusicTheme
+import com.nlx.music.ui.theme.ThemeViewModel
+import dagger.hilt.android.AndroidEntryPoint
+import javax.inject.Inject
+
+// Last.fm redirects its Custom Tab to this Activity after approval.
+@AndroidEntryPoint
+class MainActivity : androidx.fragment.app.FragmentActivity() {
+
+    @Inject
+    lateinit var lastFmAuthCallback: LastFmAuthCallbackCoordinator
+
+    @Inject
+    lateinit var linkPlaybackResolver: dagger.Lazy<com.nlx.music.playback.LinkPlaybackResolver>
+
+    @Inject
+    lateinit var appRouteNavigator: dagger.Lazy<com.nlx.music.ui.navigation.AppRouteNavigator>
+
+    @Inject
+    lateinit var settingsPreferences: com.nlx.music.data.local.SettingsPreferences
+
+    @Inject
+    lateinit var appLocaleManager: AppLocaleManager
+
+    @Inject
+    lateinit var trackDownloadManager: dagger.Lazy<com.nlx.music.data.download.TrackDownloadManager>
+
+    private val audioPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
+        if (isGranted) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                runCatching { trackDownloadManager.get().restoreDownloadsAfterReinstall() }
+            }
+        }
+    }
+
+    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        checkAndRequestAudioPermission()
+    }
+
+    override fun attachBaseContext(newBase: Context) {
+        // FragmentActivity gets no AppCompat locale backport, so pin the
+        // selected locale here on every creation (all API levels).
+        super.attachBaseContext(AppLocaleManager.wrap(newBase))
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        StartupTrail.mark("activity.onCreate.start")
+        // Must be called before super.onCreate() and before setContent().
+        val splashScreen = runCatching { installSplashScreen() }
+            .onFailure { android.util.Log.e(STARTUP_TAG, "Splash compatibility layer unavailable", it) }
+            .getOrNull()
+        super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // Adopt choices made via system Settings -> App languages so the
+            // in-app picker shows the truth. The framework recreates us itself.
+            lifecycleScope.launch {
+                runCatching { appLocaleManager.syncFromSystemIfNeeded() }
+            }
+        } else {
+            // No framework per-app locales here: recreate once per language
+            // change so attachBaseContext re-wraps with the new locale.
+            // drop(1) skips the initial emission — recreation never loops.
+            lifecycleScope.launch {
+                runCatching {
+                    settingsPreferences.settings
+                        .map { it.appLanguageTag }
+                        .distinctUntilChanged()
+                        .drop(1)
+                        .collect { recreate() }
+                }
+            }
+        }
+        // Launch intents (play-from-search, shared/opened links, deep nav) must
+        // only be consumed on the first creation. On rotation or config-change
+        // recreation (savedInstanceState != null) re-running them would re-fire
+        // playback or re-navigate; subsequent intents arrive via onNewIntent.
+        if (savedInstanceState == null) {
+            runCatching { lastFmAuthCallback.capture(intent) }
+                .onFailure { android.util.Log.e(STARTUP_TAG, "Auth callback ignored during startup", it) }
+            handlePlaybackIntent(intent)
+            handleNavigationIntent(intent)
+        }
+        runCatching {
+            splashScreen?.setOnExitAnimationListener { provider ->
+                runCatching {
+                    provider.view.animate()
+                        .alpha(0f)
+                        .scaleX(1.025f)
+                        .scaleY(1.025f)
+                        .setDuration(260L)
+                        .setInterpolator(android.view.animation.PathInterpolator(0.2f, 0f, 0f, 1f))
+                        .withEndAction { runCatching { provider.remove() } }
+                        .start()
+                }.onFailure {
+                    android.util.Log.w(STARTUP_TAG, "Splash exit animation skipped", it)
+                    runCatching { provider.remove() }
+                }
+            }
+        }.onFailure { android.util.Log.w(STARTUP_TAG, "Splash exit listener unavailable", it) }
+        runCatching {
+            enableEdgeToEdge(
+                statusBarStyle = androidx.activity.SystemBarStyle.auto(
+                    android.graphics.Color.TRANSPARENT,
+                    android.graphics.Color.TRANSPARENT,
+                ),
+                navigationBarStyle = androidx.activity.SystemBarStyle.auto(
+                    android.graphics.Color.TRANSPARENT,
+                    android.graphics.Color.TRANSPARENT,
+                ),
+            )
+        }
+        if (savedInstanceState == null) {
+            val needsNotificationPermission = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+
+            if (needsNotificationPermission) {
+                runCatching { notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS) }
+                    .onFailure {
+                        android.util.Log.w(STARTUP_TAG, "Notification permission request skipped", it)
+                        checkAndRequestAudioPermission()
+                    }
+            } else {
+                checkAndRequestAudioPermission()
+            }
+        }
+
+        setContent {
+            val themeViewModel: ThemeViewModel = hiltViewModel()
+            val themeState by themeViewModel.uiState.collectAsStateWithLifecycle()
+
+            NlxMusicTheme(themeState = themeState) {
+                val currentConfig = androidx.compose.ui.platform.LocalViewConfiguration.current
+                androidx.compose.runtime.CompositionLocalProvider(
+                    androidx.compose.ui.platform.LocalViewConfiguration provides object : androidx.compose.ui.platform.ViewConfiguration by currentConfig {
+                        override val touchSlop: Float
+                            get() = currentConfig.touchSlop * 1.5f
+                        override val minimumTouchTargetSize: androidx.compose.ui.unit.DpSize
+                            get() = androidx.compose.ui.unit.DpSize(48.dp, 48.dp)
+                    }
+                ) {
+                    val navController = rememberNavController()
+                    val backStackEntry by navController.currentBackStackEntryAsState()
+                    val hasBottomNavigation = backStackEntry?.destination?.route == Screen.MainShell.route
+
+                    PlayerHost(hasBottomNavigation = hasBottomNavigation) {
+                        NlxMusicNavHost(navController)
+                    }
+                }
+            }
+        }
+        StartupTrail.mark("activity.content.set")
+        // First drawn frame: if the process dies between content.set and
+        // here, the killer lives in first composition (theme/backdrop/mini
+        // player init). Past this point the UI is alive.
+        runCatching {
+            window.decorView.viewTreeObserver.addOnPreDrawListener(
+                object : android.view.ViewTreeObserver.OnPreDrawListener {
+                    override fun onPreDraw(): Boolean {
+                        runCatching {
+                            window.decorView.viewTreeObserver.removeOnPreDrawListener(this)
+                        }
+                        StartupTrail.mark("activity.firstFrame")
+                        return true
+                    }
+                },
+            )
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        requestHighestSupportedRefreshRate()
+    }
+
+    /**
+     * Buffered log records are written on a 200ms cadence, so anything logged
+     * just before the app leaves the foreground would otherwise sit unwritten
+     * until the next launch.
+     */
+    override fun onStop() {
+        super.onStop()
+        com.nlx.music.diagnostics.AppLog.flush()
+    }
+
+    /**
+     * Marks the session as ended on purpose, so the next launch does not report
+     * a phantom "ended without a clean-shutdown marker".
+     *
+     * `isFinishing` excludes configuration changes, which destroy and recreate
+     * this activity while the session is plainly still alive.
+     */
+    override fun onDestroy() {
+        if (isFinishing) {
+            com.nlx.music.diagnostics.Diagnostics.markCleanShutdown(this)
+        }
+        super.onDestroy()
+    }
+
+    /**
+     * Ask the window scheduler for the panel's fastest supported rate. This is
+     * a preference, not a forced mode: Android can still lower it for battery,
+     * thermals or a user's display setting, and 60 Hz panels remain at 60 Hz.
+     */
+    @Suppress("DEPRECATION")
+    private fun requestHighestSupportedRefreshRate() {
+        runCatching {
+            val display = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                display ?: windowManager.defaultDisplay
+            } else {
+                windowManager.defaultDisplay
+            }
+            val currentMode = display.mode
+            val matchingModes = display.supportedModes.filter {
+                it.physicalWidth == currentMode.physicalWidth &&
+                    it.physicalHeight == currentMode.physicalHeight
+            }
+            val highestMode = matchingModes.maxByOrNull { it.refreshRate } ?: currentMode
+            val attributes = window.attributes
+            var changed = false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && attributes.preferredDisplayModeId != highestMode.modeId) {
+                attributes.preferredDisplayModeId = highestMode.modeId
+                changed = true
+            }
+            if (attributes.preferredRefreshRate != highestMode.refreshRate) {
+                attributes.preferredRefreshRate = highestMode.refreshRate
+                changed = true
+            }
+            if (changed) {
+                window.attributes = attributes
+            }
+        }
+    }
+
+    private fun handlePlaybackIntent(intent: Intent?) {
+        if (intent?.action == android.provider.MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH) {
+            val playbackIntent = Intent(this, com.nlx.music.playback.MusicPlaybackService::class.java)
+                .setAction(intent.action)
+            intent.extras?.let { playbackIntent.putExtras(it) }
+            androidx.core.content.ContextCompat.startForegroundService(this, playbackIntent)
+            return
+        }
+        val uri = intent?.data
+        val host = uri?.host.orEmpty().lowercase()
+        val isSupportedMusicLink = intent?.action == Intent.ACTION_VIEW &&
+            (uri?.scheme == "http" || uri?.scheme == "https") &&
+            (host == "youtube.com" || host == "www.youtube.com" ||
+                host == "m.youtube.com" || host == "music.youtube.com" || host == "youtu.be" ||
+                host == "open.spotify.com" || host == "spotify.link")
+        val hasPlaybackTarget = isSupportedMusicLink || intent?.action == Intent.ACTION_SEND
+        if (hasPlaybackTarget) {
+            runCatching { linkPlaybackResolver.get().handleIntent(intent) }
+        }
+    }
+
+    private fun handleNavigationIntent(intent: Intent?) {
+        if (intent == null) return
+        val uri = intent.data
+        if (uri?.scheme == "nlxmusic" && (uri.host == "jam" || uri.host == "sync")) {
+            val code = uri.getQueryParameter("code")
+            runCatching { appRouteNavigator.get().navigateTo(Screen.Jam.createRoute(code)) }
+            return
+        }
+        val isDownloadsTarget = intent.action == com.nlx.music.data.download.TrackDownloadManager.ACTION_VIEW_DOWNLOADS ||
+            intent.getStringExtra(com.nlx.music.data.download.TrackDownloadManager.EXTRA_NAVIGATE_TO) == Screen.Downloads.route
+        if (isDownloadsTarget) {
+            runCatching { appRouteNavigator.get().navigateTo(Screen.Downloads.route) }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        runCatching { lastFmAuthCallback.capture(intent) }
+        handlePlaybackIntent(intent)
+        handleNavigationIntent(intent)
+    }
+
+    private fun checkAndRequestAudioPermission() {
+        if (hasPromptedAudioThisSession) return
+        hasPromptedAudioThisSession = true
+
+        val downloadManager = trackDownloadManager.get()
+        if (downloadManager.isDownloadsScanned()) return
+
+        val requiredPermission = downloadManager.getRequiredAudioPermission()
+        if (checkSelfPermission(requiredPermission) == PackageManager.PERMISSION_GRANTED) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                runCatching { downloadManager.restoreDownloadsAfterReinstall() }
+            }
+            return
+        }
+
+        runCatching {
+            audioPermissionLauncher.launch(requiredPermission)
+        }.onFailure {
+            android.util.Log.w(STARTUP_TAG, "Audio permission request skipped", it)
+        }
+    }
+
+    private companion object {
+        const val STARTUP_TAG = "NlxMusicStartup"
+        @Volatile
+        var hasPromptedAudioThisSession = false
+    }
+}

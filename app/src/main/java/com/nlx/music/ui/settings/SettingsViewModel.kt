@@ -1,0 +1,1198 @@
+package com.nlx.music.ui.settings
+
+import androidx.compose.ui.graphics.Color
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.nlx.music.data.backup.BackupRepository
+import com.nlx.music.data.backup.RestoreResult
+import com.nlx.music.data.generate.GenerateRepository
+import com.nlx.music.data.local.AccentMode
+import com.nlx.music.data.local.ThemeMode
+import com.nlx.music.data.local.AppLanguage
+import com.nlx.music.data.local.EqualizerSettings
+import com.nlx.music.data.local.MiscSettings
+import com.nlx.music.data.local.ScrobblerPreferences
+import com.nlx.music.data.local.ScrobblerSettings
+import com.nlx.music.data.local.SessionData
+import com.nlx.music.data.local.SessionPreferences
+import com.nlx.music.data.local.SettingsPreferences
+import com.nlx.music.data.download.TrackDownloadManager
+import com.nlx.music.data.playlist.PlaylistRepository
+import com.nlx.music.data.repository.AuthRepository
+import com.nlx.music.data.repository.ThemeRepository
+import com.nlx.music.playback.MusicPlayer
+import com.nlx.music.data.repository.ThemeUiState
+import com.nlx.music.playback.NativeAudioEngine
+import com.nlx.music.util.FileExportHelper
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+enum class PendingRestoreKind { FULL_BACKUP, PLAYLIST_MIRROR }
+
+private val SettingsSharing = SharingStarted.WhileSubscribed(stopTimeoutMillis = 5_000)
+private const val SETTINGS_TAG = "SettingsViewModel"
+
+/** Settings aggregates several independent stores. A broken legacy value or
+ * one unreadable Room table must only disable that section, never crash the
+ * entire destination. Flow.catch preserves cancellation and handles only
+ * failures from the upstream source. */
+private fun <T> Flow<T>.withSettingsFallback(source: String, fallback: T): Flow<T> =
+    catch { error ->
+        android.util.Log.e(SETTINGS_TAG, "$source unavailable; using safe defaults", error)
+        emit(fallback)
+    }
+
+data class SettingsScreenState(
+    val session: SessionData = SessionData(),
+    val theme: ThemeUiState? = null,
+    val misc: MiscSettings = MiscSettings(),
+    val recommendationExclusionCount: Int = 0,
+    val toastMessage: String? = null,
+    val showColorWheel: Boolean = false,
+    val showClearAllConfirm: Boolean = false,
+    val showRestoreConfirm: Boolean = false,
+    val pendingRestoreContent: String? = null,
+    val pendingRestorePlaylistCount: Int? = null,
+    val pendingRestoreKind: PendingRestoreKind? = null,
+    val pendingRestoreUri: android.net.Uri? = null,
+    val showSessionKeyDialog: Boolean = false,
+    val sessionKeyError: String? = null,
+    val sessionKeyLoading: Boolean = false,
+)
+
+@HiltViewModel
+class SettingsViewModel @Inject constructor(
+    private val authRepository: AuthRepository,
+    private val authCallback: com.nlx.music.data.repository.LastFmAuthCallbackCoordinator,
+    private val homeRepository: com.nlx.music.data.repository.HomeRepository,
+    private val sessionPreferences: SessionPreferences,
+    private val themeRepository: ThemeRepository,
+    private val settingsPreferences: SettingsPreferences,
+    private val audioEngine: dagger.Lazy<NativeAudioEngine>,
+    private val generateRepository: GenerateRepository,
+    private val discoverRepository: com.nlx.music.data.discover.DiscoverRepository,
+    private val backupRepository: BackupRepository,
+    private val playlistRepository: PlaylistRepository,
+    private val musicPlayer: MusicPlayer,
+    private val downloadManager: TrackDownloadManager,
+    private val fileExportHelper: FileExportHelper,
+    private val scrobblerPreferences: ScrobblerPreferences,
+    private val discordPresencePreferences: com.nlx.music.presence.DiscordPresencePreferences,
+    private val equalizerPreferences: com.nlx.music.data.local.EqualizerPreferences,
+    private val loudnessPrefs: com.nlx.music.playback.LoudnessPrefs,
+    private val ytAuthManager: com.nlx.music.data.ytmusic.YtMusicAuthManager,
+    private val ytMusicSyncManager: com.nlx.music.data.ytmusic.YtMusicSyncManager,
+    private val ytMusicPreferences: com.nlx.music.data.ytmusic.YtMusicPreferences,
+    private val ytMusicLibraryManager: com.nlx.music.data.ytmusic.YtMusicLibraryManager,
+    private val downloadedTrackDao: com.nlx.music.data.local.db.DownloadedTrackDao,
+    private val podcastProgressStore: com.nlx.music.data.podcast.PodcastProgressStore,
+    private val appLocaleManager: com.nlx.music.util.AppLocaleManager,
+    val playlistImportManager: com.nlx.music.data.playlist.PlaylistImportManager,
+    val innerTube: com.nlx.music.data.music.InnerTubeMusicApi,
+    val appUpdateManager: com.nlx.music.data.update.AppUpdateManager,
+    private val spotifyPreferences: com.nlx.music.data.spotify.SpotifyPreferences,
+    @dagger.hilt.android.qualifiers.ApplicationContext private val context: android.content.Context,
+) : ViewModel() {
+
+    private val appContext: android.content.Context get() = context
+
+    val authState: StateFlow<com.nlx.music.data.model.AuthState> = authRepository.authState
+    val updateInfo = appUpdateManager.updateInfo
+
+    fun checkForUpdates() = appUpdateManager.checkForUpdate(isSilent = false)
+    fun openUpdate(context: android.content.Context) = appUpdateManager.openUpdate(context)
+
+    val spotifyConnected: StateFlow<Boolean> = spotifyPreferences.isConnected
+        .withSettingsFallback("Spotify connection", false)
+        .stateIn(viewModelScope, SettingsSharing, false)
+
+    val spotifyCanvasEnabled: StateFlow<Boolean> = spotifyPreferences.canvasEnabled
+        .withSettingsFallback("Spotify canvas preference", true)
+        .stateIn(viewModelScope, SettingsSharing, true)
+
+    val spotifySyncLikedSongsEnabled: StateFlow<Boolean> = spotifyPreferences.syncLikedSongsEnabled
+        .withSettingsFallback("Spotify sync liked songs preference", true)
+        .stateIn(viewModelScope, SettingsSharing, true)
+
+    fun setSpotifyCanvasEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            spotifyPreferences.setCanvasEnabled(enabled)
+        }
+    }
+
+    fun setSpotifySyncLikedSongsEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            spotifyPreferences.setSyncLikedSongsEnabled(enabled)
+        }
+    }
+
+    fun disconnectSpotify() {
+        viewModelScope.launch {
+            spotifyPreferences.clearConnection()
+        }
+    }
+
+    /** YouTube Music account connection + playlist-sync state (§ YouTube Music). */
+    val ytConnection: StateFlow<com.nlx.music.data.ytmusic.YtConnection> = ytAuthManager.connection
+    val ytSyncState: StateFlow<com.nlx.music.data.ytmusic.YtSyncState> = ytMusicSyncManager.state
+    val ytSyncEnabled: StateFlow<Boolean> = ytMusicPreferences.syncEnabled
+        .withSettingsFallback("YouTube sync preference", false)
+        .stateIn(viewModelScope, SettingsSharing, false)
+    /** History sync defaults ON (see YtMusicPreferences.historySyncEnabled). */
+    val ytHistorySyncEnabled: StateFlow<Boolean> = ytMusicPreferences.historySyncEnabled
+        .withSettingsFallback("YouTube history sync preference", true)
+        .stateIn(viewModelScope, SettingsSharing, true)
+    val ytLastSyncAt: StateFlow<Long> = ytMusicPreferences.lastSyncAt
+        .withSettingsFallback("YouTube sync timestamp", 0L)
+        .stateIn(viewModelScope, SettingsSharing, 0L)
+    val syncedPlaylistIds: StateFlow<Set<Long>?> = ytMusicPreferences.syncedPlaylistIds
+        .withSettingsFallback("YouTube playlist selection", null)
+        .stateIn(viewModelScope, SettingsSharing, null)
+    /**
+     * Discord Rich Presence switch. Defaults ON (see
+     * [com.nlx.music.presence.DiscordPresencePreferences.enabled]).
+     *
+     * No nudge to the publisher is needed: DiscordPresenceManager observes this
+     * very preference, so writing it evaluates presence against the current
+     * playback state immediately — the card is hidden or shown now, not at the
+     * next track change.
+     */
+    val discordPresenceEnabled: StateFlow<Boolean> = discordPresencePreferences.enabled
+        .withSettingsFallback("Discord presence preference", true)
+        .stateIn(viewModelScope, SettingsSharing, true)
+
+    fun setDiscordPresenceEnabled(enabled: Boolean) {
+        launchSettingsAction("update Discord presence") {
+            discordPresencePreferences.setEnabled(enabled)
+        }
+    }
+    val ytAccountPlaylists = ytMusicLibraryManager.accountPlaylists
+    val hiddenYtLibraryPlaylistIds: StateFlow<Set<String>> = ytMusicPreferences.hiddenLibraryPlaylistIds
+        .withSettingsFallback("YouTube library visibility", emptySet())
+        .stateIn(viewModelScope, SettingsSharing, emptySet())
+    private val _ytChannels = MutableStateFlow<List<com.nlx.music.data.music.YtChannelOption>>(emptyList())
+    val ytChannels: StateFlow<List<com.nlx.music.data.music.YtChannelOption>> = _ytChannels.asStateFlow()
+    private val _ytChannelsLoading = MutableStateFlow(false)
+    val ytChannelsLoading: StateFlow<Boolean> = _ytChannelsLoading.asStateFlow()
+    val allPlaylists: StateFlow<List<com.nlx.music.data.playlist.SavedPlaylist>> = playlistRepository.playlists
+        .map { playlists -> playlists }
+        .withSettingsFallback("playlists", emptyList())
+        .stateIn(viewModelScope, SettingsSharing, emptyList())
+
+    private val _avatarUrl = MutableStateFlow<String?>(null)
+    val avatarUrl: StateFlow<String?> = _avatarUrl.asStateFlow()
+
+    val session: StateFlow<SessionData> = kotlinx.coroutines.flow.combine(
+        sessionPreferences.session,
+        authRepository.authState,
+    ) { sess, auth ->
+        if (sess.username.isNotBlank()) {
+            sess
+        } else if (auth is com.nlx.music.data.model.AuthState.SignedIn && auth.username.isNotBlank()) {
+            sess.copy(username = auth.username)
+        } else {
+            sess
+        }
+    }
+        .withSettingsFallback("session", SessionData())
+        .stateIn(viewModelScope, SettingsSharing, SessionData())
+
+    private val _searchQuery = MutableStateFlow("")
+    val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
+
+    private val _searchResults = MutableStateFlow<List<MatchResult>>(emptyList())
+    val searchResults: StateFlow<List<MatchResult>> = _searchResults.asStateFlow()
+
+    init {
+        viewModelScope.launch(Dispatchers.IO) {
+            session.collect { sess ->
+                if (sess.username.isNotBlank()) {
+                    homeRepository.fetchStats(sess.username).onSuccess { stats ->
+                        _avatarUrl.value = stats.avatarUrl
+                    }
+                } else {
+                    _avatarUrl.value = null
+                }
+            }
+        }
+
+        @OptIn(FlowPreview::class)
+        viewModelScope.launch {
+            _searchQuery
+                .debounce(150)
+                .collect { query ->
+                    if (query.isBlank()) {
+                        _searchResults.value = emptyList()
+                    } else {
+                        val results = withContext(Dispatchers.Default) {
+                            FuzzyMatcher.search(query, SettingsSearchIndex.allEntries)
+                        }
+                        _searchResults.value = results
+                    }
+                }
+        }
+    }
+
+    val theme: StateFlow<ThemeUiState> = themeRepository.uiState
+
+    val misc: StateFlow<MiscSettings> = settingsPreferences.settings
+        .withSettingsFallback("misc preferences", MiscSettings())
+        .stateIn(viewModelScope, SettingsSharing, MiscSettings())
+
+    val scrobbler: StateFlow<ScrobblerSettings> = scrobblerPreferences.settings
+        .withSettingsFallback("scrobbler preferences", ScrobblerSettings())
+        .stateIn(viewModelScope, SettingsSharing, ScrobblerSettings())
+
+    /** Experimental 15-band equalizer state (Settings → Experimental). */
+    val equalizer: StateFlow<EqualizerSettings> = equalizerPreferences.settings
+        .withSettingsFallback("equalizer preferences", EqualizerSettings())
+        .stateIn(viewModelScope, SettingsSharing, EqualizerSettings())
+    private var immediateEqGains = EqualizerSettings().gainsDb.toFloatArray()
+    private var immediateEqEnabled = false
+
+    val downloadCount: StateFlow<Int> = downloadedTrackDao.count()
+        .withSettingsFallback("download count", 0)
+        .stateIn(viewModelScope, SettingsSharing, 0)
+
+    val downloadTotalBytes: StateFlow<Long?> = downloadedTrackDao.totalBytes()
+        .withSettingsFallback("download size", 0L)
+        .stateIn(viewModelScope, SettingsSharing, 0L)
+
+    private val _uiState = MutableStateFlow(SettingsScreenState())
+    val uiState: StateFlow<SettingsScreenState> = _uiState.asStateFlow()
+
+    /** Prevent DataStore/Room/runtime write failures from escaping as an
+     * uncaught root coroutine and terminating the app. */
+    private fun launchSettingsAction(action: String, block: suspend () -> Unit) =
+        viewModelScope.launch {
+            try {
+                block()
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (error: Exception) {
+                android.util.Log.e(SETTINGS_TAG, "Failed to $action", error)
+                val toast = runCatching {
+                    appContext.getString(com.nlx.music.R.string.toast_action_fail, action)
+                }.getOrDefault("Couldn't $action. Please try again.")
+                _uiState.update { state ->
+                    state.copy(toastMessage = toast)
+                }
+            } catch (error: LinkageError) {
+                // Missing/altered framework or JNI symbols on a custom ROM
+                // disable only this action, never the Settings destination.
+                android.util.Log.e(SETTINGS_TAG, "Unsupported platform action: $action", error)
+                val toast = runCatching {
+                    appContext.getString(com.nlx.music.R.string.toast_unsupported)
+                }.getOrDefault("This action isn't supported on this device.")
+                _uiState.update { state ->
+                    state.copy(toastMessage = toast)
+                }
+            }
+        }
+
+    private val eqPreviews = Channel<Pair<Boolean, FloatArray>>(Channel.CONFLATED)
+
+    private suspend fun applyNativeAudio(block: (NativeAudioEngine) -> Unit) =
+        withContext(Dispatchers.Default) { block(audioEngine.get()) }
+
+    init {
+        viewModelScope.launch {
+            for ((enabled, gains) in eqPreviews) {
+                try {
+                    applyNativeAudio { it.setEqualizer(enabled, gains) }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    android.util.Log.e(SETTINGS_TAG, "Equalizer preview failed", error)
+                    _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_eq_fail)) }
+                } catch (error: LinkageError) {
+                    android.util.Log.e(SETTINGS_TAG, "Equalizer unavailable", error)
+                    _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_eq_missing)) }
+                }
+            }
+        }
+        viewModelScope.launch {
+            equalizer.collect {
+                immediateEqEnabled = it.enabled
+                immediateEqGains = it.gainsDb.toFloatArray()
+            }
+        }
+        viewModelScope.launch {
+            generateRepository.observeRecommendationExclusions()
+                .withSettingsFallback("recommendation exclusions", emptyList())
+                .collect { exclusions ->
+                    _uiState.update { it.copy(recommendationExclusionCount = exclusions.size) }
+                }
+        }
+    }
+
+    fun refreshRecommendationExclusionCount() {
+        launchSettingsAction("refresh exclusions") {
+            val count = generateRepository.recommendationExclusionCount()
+            _uiState.update { it.copy(recommendationExclusionCount = count) }
+        }
+    }
+
+    // ── Integrations / Scrobbling: Last.fm is optional and lives here, not
+    //    in onboarding. Bring-your-own-key with no shared key: everyone
+    //    pastes their own API key/secret (created at last.fm/api/account/
+    //    create) before connecting. Connect/disconnect anytime; stats +
+    //    scrobbling degrade to local-first when disconnected. ──
+
+    /** True when a Last.fm username is persisted (scrobbles sync globally). */
+    val isLastFmConnected: StateFlow<Boolean> = session
+        .map { it.username.isNotBlank() }
+        .stateIn(viewModelScope, SettingsSharing, false)
+
+    /**
+     * True when the user pasted their own API key + secret. There is no
+     * shared key: web auth and every Last.fm call require this.
+     */
+    val hasApiKey: StateFlow<Boolean> = session
+        .map { it.apiKey.isNotBlank() && it.apiSecret.isNotBlank() }
+        .stateIn(viewModelScope, SettingsSharing, false)
+
+    fun saveApiCredentials(apiKey: String, apiSecret: String) {
+        val key = apiKey.trim()
+        val secret = apiSecret.trim()
+        if (key.length < 16 || secret.length < 16) {
+            _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_key_short)) }
+            return
+        }
+        launchSettingsAction("save API credentials") {
+            authRepository.saveApiCredentials(key, secret)
+            _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_key_saved)) }
+        }
+    }
+
+    /** Forgets the saved key (e.g. it was revoked). Reconnecting needs a key again. */
+    fun clearApiKey() {
+        launchSettingsAction("remove the API key") {
+            sessionPreferences.setApiCredentials("", "")
+            _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_key_removed)) }
+        }
+    }
+
+    /** Pending Last.fm web-auth URL for Settings to open in Custom Tabs. Null when idle. */
+    private val _lastFmAuthUrl = MutableStateFlow<String?>(null)
+    val lastFmAuthUrl: StateFlow<String?> = _lastFmAuthUrl.asStateFlow()
+
+    private val _lastFmConnecting = MutableStateFlow(false)
+    val lastFmConnecting: StateFlow<Boolean> = _lastFmConnecting.asStateFlow()
+
+    init {
+        // Complete Settings-initiated Last.fm web auth from the app callback.
+        // AuthViewModel observes the same singleton for the (legacy) login
+        // path; both funnel through AuthRepository.completeWebAuth.
+        viewModelScope.launch {
+            authCallback.pendingToken.collect { token ->
+                token ?: return@collect
+                if (_lastFmAuthUrl.value == null && !_lastFmConnecting.value) return@collect
+                authCallback.consume(token)
+                _lastFmConnecting.value = true
+                try {
+                    val result = authRepository.completeWebAuth(token)
+                    if (result.isFailure) {
+                        _uiState.update {
+                            it.copy(toastMessage = result.exceptionOrNull()?.message ?: "Could not connect Last.fm")
+                        }
+                    } else {
+                        runCatching { sessionPreferences.exitGuestMode() }
+                        _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_lfm_ok)) }
+                    }
+                } finally {
+                    _lastFmConnecting.value = false
+                    _lastFmAuthUrl.value = null
+                }
+            }
+        }
+    }
+
+    /** Starts Last.fm web auth; the URL flows to Settings via [lastFmAuthUrl]. */
+    fun beginLastFmConnect() {
+        val url = authRepository.authUrl()
+        if (url == null) {
+            _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_lfm_need_key)) }
+            return
+        }
+        _lastFmAuthUrl.value = url
+    }
+
+    fun cancelLastFmConnect() {
+        _lastFmAuthUrl.value = null
+        _lastFmConnecting.value = false
+    }
+
+    fun onReturnedFromBrowser() {
+        authCallback.pendingToken.value?.let { token ->
+            // Collected by the init observer above; this is a resume fallback.
+        }
+    }
+
+    fun disconnectLastFm() {
+        launchSettingsAction("disconnect Last.fm") {
+            authRepository.signOut()
+            _lastFmAuthUrl.value = null
+            _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_lfm_off)) }
+        }
+    }
+
+    fun logOut(onComplete: () -> Unit) {
+        launchSettingsAction("log out") {
+            sessionPreferences.logOutApiCredentials()
+            onComplete()
+        }
+    }
+
+    fun clearSession(onComplete: () -> Unit) {
+        launchSettingsAction("clear the session") {
+            sessionPreferences.clearAll()
+            onComplete()
+        }
+    }
+
+    // ── Appearance (§8.2 / §8.3 / §8.4) ──
+
+    fun setThemeMode(mode: ThemeMode) = launchSettingsAction("update theme mode") { themeRepository.setThemeMode(mode) }
+    fun setAmoled(enabled: Boolean) = launchSettingsAction("update AMOLED mode") { themeRepository.setAmoled(enabled) }
+    fun setLiquidGlass(enabled: Boolean) = launchSettingsAction("update Liquid Glass") { themeRepository.setLiquidGlass(enabled) }
+    fun setMd3NavBar(enabled: Boolean) = launchSettingsAction("update MD3 Navigation Bar") { themeRepository.setMd3NavBar(enabled) }
+    fun setAccentMode(mode: AccentMode) = launchSettingsAction("update accent mode") { themeRepository.setMode(mode) }
+    fun setManualAccent(color: Color) = launchSettingsAction("update accent color") { themeRepository.setManualAccent(color) }
+    fun openColorWheel() = _uiState.update { it.copy(showColorWheel = true) }
+    fun dismissColorWheel() = _uiState.update { it.copy(showColorWheel = false) }
+    fun applyCustomColor(color: Color) {
+        setManualAccent(color)
+        dismissColorWheel()
+    }
+
+    fun setDynamicNowPlaying(enabled: Boolean) = launchSettingsAction("update dynamic theme") { themeRepository.setDynamicNowPlaying(enabled) }
+    fun setUseCustomFont(enabled: Boolean) = launchSettingsAction("update the app font") { settingsPreferences.setUseCustomFont(enabled) }
+    fun setPreferLosslessStreaming(enabled: Boolean) = launchSettingsAction("update streaming preference") { settingsPreferences.setPreferLosslessStreaming(enabled) }
+    fun setLosslessQuality(quality: Int) = launchSettingsAction("update streaming quality") { settingsPreferences.setLosslessQuality(quality) }
+    fun setDownloadQuality(quality: Int) = launchSettingsAction("update download quality") { settingsPreferences.setDownloadQuality(quality) }
+    fun setStudioMasterClarity(enabled: Boolean) {
+        // Apply immediately; DataStore persists the same state for future engine instances.
+        launchSettingsAction("update Studio Master Clarity") {
+            applyNativeAudio { it.setStudioMasterClarity(enabled) }
+            settingsPreferences.setStudioMasterClarity(enabled)
+            if (enabled) {
+                // Enabling DSP clarity disables Bit-Perfect mode
+                settingsPreferences.setBitPerfectEnabled(false)
+                applyNativeAudio { it.setBitPerfect(false) }
+                com.nlx.music.playback.usb.UsbExclusivePrefs.setEnabled(context, false)
+            }
+        }
+    }
+    fun setBitPerfectEnabled(enabled: Boolean) {
+        launchSettingsAction("update Bit-Perfect mode") {
+            applyNativeAudio { it.setBitPerfect(enabled) }
+            settingsPreferences.setBitPerfectEnabled(enabled)
+            com.nlx.music.playback.usb.UsbExclusivePrefs.setEnabled(context, enabled)
+            if (enabled) {
+                // When Bit-Perfect is turned on, automatically turn off Studio Master Clarity
+                settingsPreferences.setStudioMasterClarity(false)
+                applyNativeAudio { it.setStudioMasterClarity(false) }
+            }
+        }
+    }
+
+    /** System audio-effects mode (Settings -> Experimental, default OFF):
+     *  flattens in-app DSP on mixer routes and publishes the audio session
+     *  for external equalizer / OEM Dolby processing. Bypass routes suspend
+     *  it automatically in the player; no native call needed here. */
+    fun setSystemEffectsMode(enabled: Boolean) = launchSettingsAction("update system effects mode") {
+        settingsPreferences.setSystemEffectsMode(enabled)
+    }
+
+    // ── USB exclusive output (direct DAC, default OFF) ──
+
+    val usbExclusiveEnabled: StateFlow<Boolean> =
+        com.nlx.music.playback.usb.UsbExclusivePrefs.enabledFlow(context)
+            .withSettingsFallback("USB exclusive output", false)
+            .stateIn(viewModelScope, SettingsSharing, false)
+
+    fun setUsbExclusiveEnabled(enabled: Boolean) = launchSettingsAction("update USB exclusive output") {
+        if (enabled && android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q) {
+            _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_usb_old)) }
+            return@launchSettingsAction
+        }
+        com.nlx.music.playback.usb.UsbExclusivePrefs.setEnabled(context, enabled)
+        if (enabled) {
+            applyNativeAudio { it.setBitPerfect(true) }
+            settingsPreferences.setBitPerfectEnabled(true)
+            settingsPreferences.setStudioMasterClarity(false)
+            applyNativeAudio { it.setStudioMasterClarity(false) }
+            _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_usb_on)) }
+        }
+    }
+
+    // ── Fork: internal direct output (mixer bypass without a USB DAC) ──
+
+    val internalDirectEnabled: StateFlow<Boolean> =
+        com.nlx.music.playback.usb.InternalDirectPrefs.enabledFlow(context)
+            .withSettingsFallback("internal direct output", false)
+            .stateIn(viewModelScope, SettingsSharing, false)
+
+    val forceSoftwareVolume: StateFlow<Boolean> =
+        com.nlx.music.playback.usb.InternalDirectPrefs.forceSoftwareVolumeFlow(context)
+            .withSettingsFallback("software volume", false)
+            .stateIn(viewModelScope, SettingsSharing, false)
+
+    /** Collecting this (settings screen visible) lets route changes re-probe the output. */
+    val internalDirectAvailability = musicPlayer.internalDirectAvailability
+
+    /** Probes what the current output accepts; called when the audio settings open. */
+    fun refreshInternalDirectAvailability() {
+        musicPlayer.refreshInternalDirectAvailability()
+    }
+
+    fun setInternalDirectEnabled(enabled: Boolean) = launchSettingsAction("update internal direct output") {
+        com.nlx.music.playback.usb.InternalDirectPrefs.setEnabled(context, enabled)
+        if (enabled) {
+            // Same contract as USB exclusive: Bit-Perfect is what turns the DSP off.
+            applyNativeAudio { it.setBitPerfect(true) }
+            settingsPreferences.setBitPerfectEnabled(true)
+            settingsPreferences.setStudioMasterClarity(false)
+            applyNativeAudio { it.setStudioMasterClarity(false) }
+            _uiState.update {
+                it.copy(toastMessage = context.getString(com.nlx.music.R.string.settings_internal_direct_enabled_toast))
+            }
+        }
+        musicPlayer.refreshInternalDirectAvailability()
+    }
+
+    fun setForceSoftwareVolume(enabled: Boolean) = launchSettingsAction("update software volume") {
+        com.nlx.music.playback.usb.InternalDirectPrefs.setForceSoftwareVolume(context, enabled)
+    }
+
+    // ── Clarity output preset + spatial bypass ──
+
+    fun setClarityPreset(preset: Int) = launchSettingsAction("update clarity preset") {
+        val safe = preset.coerceIn(0, 3)
+        applyNativeAudio { it.setClarityPreset(com.nlx.music.playback.ClarityPresets.fromIndex(safe)) }
+        settingsPreferences.setClarityPreset(safe)
+    }
+
+    fun setClarityAtmosBypass(enabled: Boolean) = launchSettingsAction("update clarity spatial bypass") {
+        applyNativeAudio { it.setClarityAtmosBypass(enabled) }
+        settingsPreferences.setClarityAtmosBypass(enabled)
+    }
+
+    // ── Loudness normalization (ReplayGain, default OFF) ──
+
+    val loudness: StateFlow<com.nlx.music.playback.LoudnessSettings> = loudnessPrefs.settings
+        .withSettingsFallback("loudness normalization", com.nlx.music.playback.LoudnessSettings())
+        .stateIn(viewModelScope, SettingsSharing, com.nlx.music.playback.LoudnessSettings())
+
+    fun setLoudnessMode(mode: com.nlx.music.playback.LoudnessMode) =
+        launchSettingsAction("update loudness mode") { loudnessPrefs.setMode(mode) }
+
+    fun setLoudnessPreamp(preampDb: Float) =
+        launchSettingsAction("update loudness preamp") { loudnessPrefs.setPreampDb(preampDb) }
+    fun setPodcastsEnabled(enabled: Boolean) = launchSettingsAction("update podcasts setting") {
+        settingsPreferences.setPodcastsEnabled(enabled)
+    }
+    fun setWordByWordLyrics(enabled: Boolean) = launchSettingsAction("update word-by-word lyrics") { settingsPreferences.setWordByWordLyrics(enabled) }
+    fun setLyricsProvider(provider: com.nlx.music.data.local.LyricsProvider) = launchSettingsAction("update lyrics provider") { settingsPreferences.setLyricsProvider(provider) }
+    fun setLyricsOffsetMs(offsetMs: Long) = launchSettingsAction("update lyrics sync offset") {
+        settingsPreferences.setLyricsOffsetMs(offsetMs.coerceIn(-10000L, 10000L))
+    }
+    fun setLyricsFontScale(scale: Float) = launchSettingsAction("update lyrics font scale") {
+        settingsPreferences.setLyricsFontScale(scale)
+    }
+    fun setCrossfadeEnabled(enabled: Boolean) = launchSettingsAction("update crossfade") { settingsPreferences.setCrossfadeEnabled(enabled) }
+    fun setCrossfadeSeconds(seconds: Int) = launchSettingsAction("update crossfade duration") {
+        settingsPreferences.setCrossfadeSeconds(seconds.coerceIn(1, 12))
+    }
+    fun setWavySeekbarEnabled(enabled: Boolean) = launchSettingsAction("update seekbar style") {
+        settingsPreferences.setWavySeekbarEnabled(enabled)
+    }
+    fun setRotatingBackgroundEnabled(enabled: Boolean) = launchSettingsAction("update rotating background") {
+        settingsPreferences.setRotatingBackgroundEnabled(enabled)
+    }
+    fun setLyricsRotatingBackgroundEnabled(enabled: Boolean) = launchSettingsAction("update lyrics rotating background") {
+        settingsPreferences.setLyricsRotatingBackgroundEnabled(enabled)
+    }
+    fun setKeepLyricsScreenAwake(enabled: Boolean) = launchSettingsAction("update keep lyrics screen awake") {
+        settingsPreferences.setKeepLyricsScreenAwake(enabled)
+    }
+    fun setLyricsButtonsAutoHideSeconds(seconds: Int) = launchSettingsAction("update lyrics buttons auto-hide") {
+        settingsPreferences.setLyricsButtonsAutoHideSeconds(seconds)
+    }
+    fun setTranslationLanguage(language: String) = launchSettingsAction("update translation language") {
+        settingsPreferences.setTranslationLanguage(language)
+    }
+    fun setCanvasEnabled(enabled: Boolean) = launchSettingsAction("update canvas enabled setting") {
+        settingsPreferences.setCanvasEnabled(enabled)
+    }
+    fun setCanvasFullBleed(enabled: Boolean) = launchSettingsAction("update canvas full-bleed setting") {
+        settingsPreferences.setCanvasFullBleed(enabled)
+    }
+    fun setCanvasOverCellular(enabled: Boolean) = launchSettingsAction("update canvas cellular setting") {
+        settingsPreferences.setCanvasOverCellular(enabled)
+    }
+    fun setDownloadLyrics(enabled: Boolean) = launchSettingsAction("update download lyrics setting") {
+        settingsPreferences.setDownloadLyrics(enabled)
+    }
+
+    /** Persists + applies; AppLocaleManager owns error handling and threading. */
+    fun setAppLanguage(language: AppLanguage) {
+        appLocaleManager.applyLanguage(language)
+    }
+
+    // ── Experimental: 15-band equalizer ──
+
+    fun setEqualizerEnabled(enabled: Boolean) {
+        immediateEqEnabled = enabled
+        eqPreviews.trySend(enabled to immediateEqGains.copyOf())
+        launchSettingsAction("update the equalizer") { equalizerPreferences.setEnabled(enabled) }
+    }
+
+    /** Selecting a preset also switches the EQ on — an off equalizer with a
+     *  fresh preset would read as a dead control. */
+    fun applyEqPreset(name: String) {
+        com.nlx.music.data.local.EqualizerPresets.byName(name)?.let { preset ->
+            immediateEqEnabled = true
+            immediateEqGains = preset.gainsDb.toFloatArray()
+            eqPreviews.trySend(true to immediateEqGains.copyOf())
+            launchSettingsAction("apply the equalizer preset") { equalizerPreferences.applyPreset(preset) }
+        }
+    }
+
+    /** Audible preview during drag; persistence is deferred until release. */
+    fun previewEqBandGain(bandIndex: Int, gainDb: Float) {
+        if (bandIndex !in immediateEqGains.indices || !gainDb.isFinite()) return
+        immediateEqGains = immediateEqGains.copyOf().also {
+            it[bandIndex] = gainDb.coerceIn(
+                -com.nlx.music.data.local.EQ_MAX_GAIN_DB,
+                com.nlx.music.data.local.EQ_MAX_GAIN_DB,
+            )
+        }
+        eqPreviews.trySend(immediateEqEnabled to immediateEqGains.copyOf())
+    }
+
+    /** Manual band drag → curve becomes Custom. */
+    fun setEqBandGain(bandIndex: Int, gainDb: Float) {
+        if (bandIndex !in immediateEqGains.indices) return
+        previewEqBandGain(bandIndex, gainDb)
+        launchSettingsAction("update the equalizer band") { equalizerPreferences.setBandGain(bandIndex, gainDb) }
+    }
+
+    // ── Data management (§8.5) ──
+
+    fun clearRecommendationExclusions() {
+        launchSettingsAction("clear exclusions") {
+            discoverRepository.clearRecommendationExclusions()
+            refreshRecommendationExclusionCount()
+            _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_excl_cleared)) }
+        }
+    }
+
+    fun requestClearAllData() = _uiState.update { it.copy(showClearAllConfirm = true) }
+    fun dismissClearAllConfirm() = _uiState.update { it.copy(showClearAllConfirm = false) }
+    fun confirmClearAllData(onComplete: () -> Unit) {
+        launchSettingsAction("clear saved data") {
+            // MusicPlayer.stopAndClear posts through Dispatchers.Main.immediate.
+            // Invoke it on the main dispatcher before any suspension so queue,
+            // service, cast, and widget state are reset before sign-out can
+            // cancel this coroutine. The singleton player stays alive.
+            withContext(Dispatchers.Main.immediate) {
+                musicPlayer.stopAndClear(clearSession = true)
+            }
+            downloadManager.clearAllDownloads()
+            discoverRepository.clearRecommendationExclusions()
+            podcastProgressStore.clear()
+            playlistRepository.clearAll()
+            runCatching { ytAuthManager.signOut() }
+            // Session last: clearing it navigates to login and can cancel this
+            // scope, which used to interrupt the reset halfway through.
+            sessionPreferences.clearAll()
+            _uiState.update { it.copy(showClearAllConfirm = false) }
+            onComplete()
+        }
+    }
+
+    // ── Backup & Restore (§8.6) ──
+
+    fun exportBackup(uri: android.net.Uri, appVersionName: String) {
+        viewModelScope.launch {
+            try {
+                val json = backupRepository.buildBackup(appVersionName)
+                if (json.isBlank()) {
+                    _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_backup_empty)) }
+                    return@launch
+                }
+                val bytesWritten = fileExportHelper.writeTextToUri(uri, json)
+                _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_backup_ok, bytesWritten / 1024)) }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_backup_fail, e.localizedMessage ?: e.message)) }
+            }
+        }
+    }
+
+    fun handleRestorePicked(uri: android.net.Uri) {
+        viewModelScope.launch {
+            try {
+                val content = fileExportHelper.readTextFromUri(uri)
+                if (content.isNullOrBlank()) {
+                    _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_empty_file)) }
+                    return@launch
+                }
+                stagePendingRestore(content, uri)
+            } catch (e: Exception) {
+                _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_restore_read, e.localizedMessage ?: e.message)) }
+            }
+        }
+    }
+
+    fun handleCsvPicked(uri: android.net.Uri) {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val displayName = runCatching {
+                    context.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                        if (it.moveToFirst()) it.getString(0) else null
+                    }
+                }.getOrNull() ?: uri.lastPathSegment?.substringAfterLast('/') ?: "Imported Playlist.csv"
+
+                val fileType = displayName.substringAfterLast('.', "File").uppercase()
+                _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_import_matching, fileType)) }
+
+                val inputStream = context.contentResolver.openInputStream(uri)
+                    ?: error("Could not open selected playlist file")
+
+                val (saved, result) = inputStream.use { playlistImportManager.importCsvStream(it, displayName) }
+                _uiState.update {
+                    it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_import_result, saved.title, result.matchedCount, result.totalRows - result.matchedCount))
+                }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_import_fail, e.localizedMessage ?: e.message))
+                }
+            }
+        }
+    }
+
+    /** Called once the file picker returns raw file content — validates and
+     *  stages the restore, showing a confirm dialog with the item count
+     *  before actually applying anything (§8.6). */
+    fun stagePendingRestore(content: String, uri: android.net.Uri) {
+        launchSettingsAction("stage the restore") {
+            val backup = try {
+                kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+                    .decodeFromString(com.nlx.music.data.backup.BackupFile.serializer(), content)
+                    .takeIf { it.type == "nlxmusic-backup" }
+            } catch (e: Exception) { null }
+            val mirrorCount = playlistRepository.publicMirrorPlaylistCount(content)
+            if (backup == null && mirrorCount == null) {
+                _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_not_json)) }
+                return@launchSettingsAction
+            }
+            _uiState.update {
+                it.copy(
+                    showRestoreConfirm = true,
+                    pendingRestoreContent = content,
+                    pendingRestorePlaylistCount = backup?.playlists?.size ?: mirrorCount,
+                    pendingRestoreKind = if (backup != null) PendingRestoreKind.FULL_BACKUP else PendingRestoreKind.PLAYLIST_MIRROR,
+                    pendingRestoreUri = uri,
+                )
+            }
+        }
+    }
+
+    fun dismissRestoreConfirm() = _uiState.update {
+        it.copy(
+            showRestoreConfirm = false,
+            pendingRestoreContent = null,
+            pendingRestorePlaylistCount = null,
+            pendingRestoreKind = null,
+            pendingRestoreUri = null,
+        )
+    }
+
+    fun confirmRestore(onComplete: () -> Unit) {
+        val pending = _uiState.value
+        val content = pending.pendingRestoreContent ?: return
+        launchSettingsAction("restore the backup") {
+            if (pending.pendingRestoreKind == PendingRestoreKind.PLAYLIST_MIRROR) {
+                pending.pendingRestoreUri?.let(fileExportHelper::rememberPlaylistMirrorUri)
+                playlistRepository.importPublicMirror(content)
+                    .onSuccess { count ->
+                        _uiState.update {
+                            it.copy(
+                                showRestoreConfirm = false,
+                                pendingRestoreContent = null,
+                                pendingRestoreKind = null,
+                                pendingRestoreUri = null,
+                                toastMessage = appContext.getString(com.nlx.music.R.string.toast_synced, count),
+                            )
+                        }
+                        kotlinx.coroutines.delay(900)
+                        onComplete()
+                    }
+                    .onFailure { error ->
+                        _uiState.update {
+                            it.copy(showRestoreConfirm = false, toastMessage = appContext.getString(com.nlx.music.R.string.toast_sync_fail, error.message))
+                        }
+                    }
+                return@launchSettingsAction
+            }
+
+            when (val result = backupRepository.restore(content)) {
+                is RestoreResult.Success -> {
+                    generateRepository.invalidateRecommendationExclusionCache()
+                    discoverRepository.reset()
+                    refreshRecommendationExclusionCount()
+                    val exclusionNote = if (result.exclusionCount > 0) " and recommendation exclusions" else ""
+                    _uiState.update {
+                        it.copy(
+                            showRestoreConfirm = false,
+                            pendingRestoreContent = null,
+                            toastMessage = appContext.getString(com.nlx.music.R.string.toast_restored, result.playlistCount, exclusionNote),
+                        )
+                    }
+                    kotlinx.coroutines.delay(900)
+                    onComplete()
+                }
+                RestoreResult.UnsupportedSchema -> _uiState.update { it.copy(showRestoreConfirm = false, toastMessage = appContext.getString(com.nlx.music.R.string.toast_newer_backup)) }
+                RestoreResult.InvalidFile -> _uiState.update { it.copy(showRestoreConfirm = false, toastMessage = appContext.getString(com.nlx.music.R.string.toast_not_backup)) }
+                is RestoreResult.Failed -> _uiState.update { it.copy(showRestoreConfirm = false, toastMessage = appContext.getString(com.nlx.music.R.string.toast_restore_fail, result.message)) }
+            }
+        }
+    }
+
+    fun showToast(message: String) = _uiState.update { it.copy(toastMessage = message) }
+
+    fun dismissToast() = _uiState.update { it.copy(toastMessage = null) }
+
+    // ── Diagnostics ──
+
+    /** Builds a troubleshooting report (app/device info, notification-listener
+     *  grant, widget snapshot + placed-widget count, persisted crash-guard
+     *  log, and this process's own logcat — readable without any permission)
+     *  and opens the system share sheet for it via the existing FileProvider
+     *  export path. Runs off the main thread; failures surface as a toast
+     *  through [launchSettingsAction]. */
+    fun exportDiagnostics() {
+        launchSettingsAction("export diagnostics") {
+            val report = withContext(Dispatchers.IO) { buildDiagnosticsReport() }
+            val filename = "nlxmusic-diagnostics-${System.currentTimeMillis()}.txt"
+            fileExportHelper.shareFile(filename, report, "text/plain")
+            _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_diag_ready)) }
+        }
+    }
+
+    private suspend fun buildDiagnosticsReport(): String = withContext(Dispatchers.IO) {
+        val sb = StringBuilder()
+        sb.appendLine("NLX_ MUSIC diagnostics")
+        sb.appendLine("time=${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())}")
+        val versionName = runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull() ?: "unknown"
+        val versionCode = runCatching {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode.toString()
+            } else {
+                @Suppress("DEPRECATION") context.packageManager.getPackageInfo(context.packageName, 0).versionCode.toString()
+            }
+        }.getOrNull() ?: "unknown"
+        sb.appendLine("app=${context.packageName} version=$versionName ($versionCode)")
+        sb.appendLine("device=${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} sdk=${android.os.Build.VERSION.SDK_INT}")
+        val snapshot = runCatching { com.nlx.music.widget.NowPlayingWidgetSnapshot.read(context) }.getOrNull()
+        if (snapshot == null) {
+            sb.appendLine("widgetSnapshot=<unreadable>")
+        } else {
+            val artExists = snapshot.artPath?.let { java.io.File(it).exists() } ?: false
+            sb.appendLine("widgetSnapshot: hasSession=${snapshot.hasSession} isPlaying=${snapshot.isPlaying}")
+            sb.appendLine("  title=${snapshot.title} artist=${snapshot.artist} album=${snapshot.album}")
+            sb.appendLine("  sourceApp=${snapshot.sourceApp} sourcePackage=${snapshot.sourcePackage}")
+            sb.appendLine("  artPath=${snapshot.artPath} artExists=$artExists")
+        }
+        val placedWidgets = runCatching {
+            val manager = android.appwidget.AppWidgetManager.getInstance(context)
+            manager.getAppWidgetIds(
+                android.content.ComponentName(context, com.nlx.music.widget.NowPlayingWidgetReceiver::class.java),
+            ).size
+        }.getOrNull()
+        sb.appendLine("placedWidgets=${placedWidgets ?: "<lookup failed>"}")
+        sb.appendLine("---- crashes (persisted across restarts) ----")
+        sb.appendLine(readCrashReports())
+        sb.appendLine("---- startup trail (how far the last launches got) ----")
+        sb.appendLine(runCatching { com.nlx.music.StartupTrail.readTail(context) }.getOrDefault("(startup trail unavailable)"))
+        sb.appendLine("---- logcat (this process) ----")
+        sb.append(readOwnLogcat())
+        sb.appendLine("---- end ----")
+        sb.toString()
+    }
+
+    /** Dumps this process's logcat ring buffer. An app may always read its
+     *  own logs without any permission; capped to the newest lines so the
+     *  share sheet stays responsive. Never throws — failures become a
+     *  one-line note. */
+    private fun readOwnLogcat(): String = runCatching {
+        val pid = android.os.Process.myPid().toString()
+        val process = ProcessBuilder("logcat", "-d", "-v", "threadtime", "--pid", pid)
+            .redirectErrorStream(true)
+            .start()
+        val lines = ArrayDeque<String>()
+        process.inputStream.bufferedReader(Charsets.UTF_8).useLines { seq ->
+            seq.forEach { line ->
+                lines.addLast(line)
+                if (lines.size > LOGCAT_MAX_LINES) lines.removeFirst()
+            }
+        }
+        if (!process.waitFor(LOGCAT_TIMEOUT_SEC, java.util.concurrent.TimeUnit.SECONDS)) {
+            runCatching { process.destroy() }
+        }
+        lines.joinToString("\n").ifBlank { "(empty log buffer)" }
+    }.getOrElse { "(logcat unavailable: ${it.message})" }
+
+    /** The retained crash reports, newest first.
+     *
+     *  `logcat` dies with the crashed process, so a post-restart export would
+     *  otherwise never show the actual stack — these files are the reason a
+     *  crash survives process death. Falls back to the pre-4.3 crash log so an
+     *  older crash is not lost. Never throws. */
+    private fun readCrashReports(): String {
+        val files = runCatching { com.nlx.music.diagnostics.CrashRecorder.crashFiles(context) }
+            .getOrDefault(emptyList())
+        val legacy = runCatching {
+            java.io.File(context.applicationInfo.dataDir, LEGACY_CRASH_LOG)
+                .takeIf { it.exists() }
+                ?.readText(Charsets.UTF_8)
+                ?.let { "\n(legacy $LEGACY_CRASH_LOG)\n$it" }
+                .orEmpty()
+        }.getOrDefault("")
+
+        if (files.isEmpty() && legacy.isBlank()) return "(no recorded crashes)"
+        return files.joinToString("\n") { file ->
+            "\n=== ${file.name} ===\n" + runCatching { file.readText(Charsets.UTF_8) }
+                .getOrElse { "(crash report unreadable: ${it.message})" }
+        } + legacy
+    }
+
+    private companion object {
+        const val LOGCAT_MAX_LINES = 3000
+        const val LOGCAT_TIMEOUT_SEC = 8L
+        const val LEGACY_CRASH_LOG = "nlxmusic_crash_guard.log"
+    }
+
+    // ── Scrobbler ──
+
+    /** The master toggle only turns scrobbling on if a session key already
+     *  exists — track.scrobble/updateNowPlaying are signed calls this app
+     *  can't make without one. If it's missing, this opens the password
+     *  dialog instead of silently flipping a switch that wouldn't actually
+     *  do anything yet; the toggle itself gets set once that succeeds. */
+    fun setScrobblerEnabled(enabled: Boolean) {
+        if (enabled && session.value.sessionKey.isBlank()) {
+            _uiState.update { it.copy(showSessionKeyDialog = true) }
+            return
+        }
+        launchSettingsAction("update scrobbling") { scrobblerPreferences.setEnabled(enabled) }
+    }
+
+    fun setSubmitNowPlaying(enabled: Boolean) = launchSettingsAction("update Now Playing submission") { scrobblerPreferences.setSubmitNowPlaying(enabled) }
+    fun setScrobblePercent(percent: Int) = launchSettingsAction("update the scrobble threshold") { scrobblerPreferences.setScrobblePercent(percent) }
+    fun setLiveTelemetryEnabled(enabled: Boolean) = launchSettingsAction("update live telemetry") { settingsPreferences.setLiveTelemetryEnabled(enabled) }
+
+    // ── YouTube Music account ──
+
+    /** Sync only turns on with a connected account; flipping it on triggers
+     *  an immediate first mirror pass instead of waiting for the next tick. */
+    fun setYtSyncEnabled(enabled: Boolean) {
+        if (enabled && !ytConnection.value.isConnected) return
+        launchSettingsAction("update YouTube sync") {
+            ytMusicPreferences.setSyncEnabled(enabled)
+            if (enabled) runCatching { ytMusicSyncManager.syncNow("enabled") }
+        }
+    }
+
+    /** History sync only turns on with a connected account. Turning it off
+     *  stops new submissions and cancels pending sync work (handled by
+     *  YtMusicHistorySyncManager); the explicit choice itself is preserved
+     *  across disconnects by YtMusicPreferences. */
+    fun setYtHistorySyncEnabled(enabled: Boolean) {
+        if (enabled && !ytConnection.value.isConnected) return
+        launchSettingsAction("update YouTube history sync") {
+            ytMusicPreferences.setHistorySyncEnabled(enabled)
+        }
+    }
+
+    fun connectWithCookies(rawText: String, onComplete: ((Boolean, String?) -> Unit)? = null) {
+        viewModelScope.launch {
+            val normalized = try {
+                com.nlx.music.data.ytmusic.CookieNormalizer.normalize(rawText)
+            } catch (e: Exception) {
+                onComplete?.invoke(false, e.message ?: "Invalid cookies. Make sure SAPISID is present.")
+                return@launch
+            }
+            try {
+                ytAuthManager.connect(normalized, "", null, null)
+                kotlinx.coroutines.withTimeoutOrNull(4_000L) { ytAuthManager.awaitLoadedConnection() }
+                runCatching { sessionPreferences.exitGuestMode() }
+                var info: com.nlx.music.data.music.YtAccountInfo? = null
+                for ((attempt, waitMs) in longArrayOf(0L, 1_200L, 2_500L, 4_000L).withIndex()) {
+                    if (waitMs > 0L) kotlinx.coroutines.delay(waitMs)
+                    info = runCatching { innerTube.fetchAccountInfo() }.getOrNull()
+                    if (info != null) break
+                }
+                val displayName = info?.accountName?.takeIf { it.isNotBlank() } ?: "Google account"
+                if (info != null) {
+                    ytAuthManager.updateAccountIdentity(info.accountName, info.channelHandle, info.photoUrl)
+                }
+                viewModelScope.launch {
+                    runCatching { ytMusicSyncManager.syncNow("connected") }
+                }
+                _uiState.update { it.copy(toastMessage = "Connected as $displayName") }
+                onComplete?.invoke(true, null)
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (e: Exception) {
+                onComplete?.invoke(false, e.localizedMessage ?: e.message ?: "Connection failed")
+            }
+        }
+    }
+
+    fun disconnectYouTube() {
+        launchSettingsAction("disconnect YouTube Music") {
+            ytMusicPreferences.setSyncEnabled(false)
+            _ytChannels.value = emptyList()
+            ytAuthManager.signOut()
+            _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_yt_off)) }
+        }
+    }
+
+    fun togglePlaylistSync(playlistId: Long, enabled: Boolean) {
+        launchSettingsAction("update playlist sync") {
+            val allIds = allPlaylists.value.map { it.id }
+            ytMusicPreferences.togglePlaylistSync(allIds, playlistId, enabled)
+            if (ytSyncEnabled.value) {
+                runCatching { ytMusicSyncManager.syncNow("selection_change") }
+            }
+        }
+    }
+
+    fun selectAllPlaylistsForSync(select: Boolean) {
+        launchSettingsAction("update playlist sync") {
+            val allIds = if (select) allPlaylists.value.map { it.id }.toSet() else emptySet()
+            ytMusicPreferences.setSyncedPlaylistIds(allIds)
+            if (ytSyncEnabled.value) {
+                runCatching { ytMusicSyncManager.syncNow("selection_change") }
+            }
+        }
+    }
+
+    fun setYtLibraryPlaylistVisible(playlistId: String, visible: Boolean) {
+        launchSettingsAction("update YouTube playlist visibility") {
+            ytMusicPreferences.setLibraryPlaylistVisible(playlistId, visible)
+        }
+    }
+
+    fun setAllYtLibraryPlaylistsVisible(visible: Boolean) {
+        launchSettingsAction("update YouTube playlist visibility") {
+            ytMusicPreferences.setAllLibraryPlaylistsVisible(
+                playlistIds = ytAccountPlaylists.value.mapTo(mutableSetOf()) { it.id },
+                visible = visible,
+            )
+        }
+    }
+
+    /** Lists every channel/profile switchable inside the signed-in session. */
+    fun loadYtChannels() {
+        if (_ytChannelsLoading.value) return
+        viewModelScope.launch {
+            if (!ytAuthManager.connection.value.isConnected) {
+                _ytChannels.value = emptyList()
+                return@launch
+            }
+            _ytChannelsLoading.value = true
+            try {
+                _ytChannels.value = innerTube.fetchAvailableChannels()
+                if (_ytChannels.value.isEmpty()) {
+                    _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_yt_channels_fail)) }
+                }
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (error: Exception) {
+                android.util.Log.e(SETTINGS_TAG, "Failed to load YouTube channels", error)
+                _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_yt_channels_fail)) }
+            } catch (error: LinkageError) {
+                _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_unsupported)) }
+            } finally {
+                _ytChannelsLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Switches the active YouTube channel inside the current session
+     * (cookies unchanged — the selection rides per-request). The library
+     * refreshes for the new channel and sync mirrors are kept per channel,
+     * so each channel re-mirrors cleanly instead of reconciling against
+     * another channel's playlists.
+     */
+    fun selectYtChannel(channel: com.nlx.music.data.music.YtChannelOption) {
+        launchSettingsAction("switch YouTube channel") {
+            ytMusicPreferences.saveChannelSelection(
+                channel.channelId,
+                channel.authUserIndex,
+                channel.accountName,
+                channel.channelHandle,
+                channel.photoUrl,
+                channel.pageId,
+            )
+            _uiState.update { it.copy(toastMessage = appContext.getString(com.nlx.music.R.string.toast_yt_switched, channel.accountName)) }
+            runCatching { ytMusicLibraryManager.refresh() }
+            if (ytSyncEnabled.value) {
+                runCatching { ytMusicSyncManager.syncNow("channel_switch") }
+            }
+        }
+    }
+
+    fun syncYouTubeNow() {
+        launchSettingsAction("sync YouTube Music") { ytMusicSyncManager.syncNow("manual") }
+    }
+
+    fun dismissSessionKeyDialog() = _uiState.update { it.copy(showSessionKeyDialog = false, sessionKeyError = null) }
+
+    fun submitPassword(password: String) {
+        _uiState.update { it.copy(sessionKeyLoading = true, sessionKeyError = null) }
+        launchSettingsAction("enable scrobbling") {
+            when (val result = authRepository.obtainSessionKey(password)) {
+                AuthRepository.SessionKeyResult.Success -> {
+                    scrobblerPreferences.setEnabled(true)
+                    _uiState.update { it.copy(showSessionKeyDialog = false, sessionKeyLoading = false, toastMessage = appContext.getString(com.nlx.music.R.string.toast_scrobble_on)) }
+                }
+                is AuthRepository.SessionKeyResult.Failed -> {
+                    _uiState.update { it.copy(sessionKeyLoading = false, sessionKeyError = result.message) }
+                }
+            }
+        }
+    }
+
+    fun onSearchQueryChange(query: String) {
+        _searchQuery.value = query
+    }
+
+    fun clearSearch() {
+        _searchQuery.value = ""
+    }
+}

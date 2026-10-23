@@ -1,0 +1,1524 @@
+package com.nlx.music.ui.playlist
+
+import android.content.Intent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.CloudSync
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.BookmarkAdd
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DragHandle
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.material.icons.filled.NearMe
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Shuffle
+import androidx.compose.material.icons.filled.SwapVert
+import androidx.compose.material.icons.rounded.MyLocation
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
+import kotlinx.coroutines.launch
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.nlx.music.data.generate.GeneratedTrack
+import com.nlx.music.data.playlist.LIKED_SONGS_MODE
+import com.nlx.music.data.playlist.LOCAL_SONGS_MODE
+import com.nlx.music.data.generate.isLocalFile
+import com.nlx.music.data.playlist.SavedPlaylist
+import com.nlx.music.data.playlist.isYouTubeOnly
+import com.nlx.music.playback.toPlayableTrack
+import com.nlx.music.ui.common.ArtworkImage
+import com.nlx.music.ui.common.ExpressiveLoadingIndicator
+import com.nlx.music.ui.common.PlaylistCover
+import com.nlx.music.ui.common.TrackContextMenuSheet
+import com.nlx.music.ui.common.TrackMenuCapabilities
+import com.nlx.music.ui.common.TrackMenuTarget
+import com.nlx.music.ui.common.adaptiveContentWidth
+import com.nlx.music.ui.shell.FloatingNavDefaults
+import com.nlx.music.ui.theme.ArtworkShape
+import com.nlx.music.ui.theme.ExpressivePillShape
+import dagger.hilt.android.lifecycle.HiltViewModel
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import javax.inject.Inject
+
+enum class PlaylistTrackSort(val labelRes: Int) {
+    CUSTOM(com.nlx.music.R.string.pd_sort_custom),
+    DATE_ADDED(com.nlx.music.R.string.pd_sort_date),
+    NAME(com.nlx.music.R.string.pd_sort_name),
+    ARTIST(com.nlx.music.R.string.pd_sort_artist),
+    PLAY_TIME(com.nlx.music.R.string.pd_sort_playtime),
+}
+
+/**
+ * Remembers each playlist's last track sort (key = playlist id), so leaving
+ * and reopening a playlist keeps e.g. "Date added ↓" instead of resetting to
+ * Custom order. Plain SharedPreferences: tiny, synchronous, read once per open.
+ */
+internal object PlaylistSortMemory {
+    private const val PREFS = "playlist_track_sort"
+
+    fun load(context: android.content.Context, playlistId: Long): Pair<PlaylistTrackSort, Boolean> {
+        val raw = context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+            .getString(playlistId.toString(), null)
+            ?: return PlaylistTrackSort.CUSTOM to true
+        val sort = PlaylistTrackSort.entries.firstOrNull { it.name == raw.substringBefore(':') }
+            ?: return PlaylistTrackSort.CUSTOM to true
+        return sort to (raw.substringAfter(':', "asc") != "desc")
+    }
+
+    fun save(context: android.content.Context, playlistId: Long, sort: PlaylistTrackSort, ascending: Boolean) {
+        val prefs = context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE).edit()
+        if (sort == PlaylistTrackSort.CUSTOM && ascending) {
+            prefs.remove(playlistId.toString())
+        } else {
+            prefs.putString(playlistId.toString(), "${sort.name}:${if (ascending) "asc" else "desc"}")
+        }
+        prefs.apply()
+    }
+}
+
+private fun formatDate(millis: Long): String =
+    SimpleDateFormat("MMM d, yyyy", Locale.getDefault()).format(Date(millis))
+
+@OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+fun PlaylistDetailScreen(
+    playlistId: Long,
+    onBack: () -> Unit,
+    onOpenPlaylist: ((Long) -> Unit)? = null,
+    viewModel: PlaylistViewModel = hiltViewModel(),
+) {
+    val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
+    val musicPlayer = com.nlx.music.ui.player.LocalMusicPlayer.current
+    val playbackState by musicPlayer.chromeState.collectAsStateWithLifecycle()
+
+    LaunchedEffect(playlistId) {
+        viewModel.loadDetail(playlistId)
+    }
+
+    LaunchedEffect(state.toastMessage) {
+        state.toastMessage?.let { msg ->
+            android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT).show()
+            viewModel.dismissToast()
+        }
+    }
+
+    val currentFound = state.detailPlaylist?.takeIf { it.id == playlistId }
+        ?: state.playlists.firstOrNull { it.id == playlistId }
+    var cachedPlaylist by remember(playlistId) {
+        mutableStateOf(currentFound)
+    }
+    LaunchedEffect(currentFound) {
+        if (currentFound != null) cachedPlaylist = currentFound
+    }
+    val playlist = currentFound ?: cachedPlaylist
+
+    if (playlist == null) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            ExpressiveLoadingIndicator(message = "Loading playlist...")
+        }
+        return
+    }
+
+    val isThisPlaylistPlaying = playbackState.isPlaying && playbackState.sourceLabel == playlist.title
+    var coverEditorOpen by remember { mutableStateOf(false) }
+    var coverPickerPending by remember { mutableStateOf(false) }
+    val coverPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            viewModel.setCustomCover(playlistId, uri.toString())
+        }
+        coverPickerPending = false
+    }
+
+    var menuTarget by remember { mutableStateOf<GeneratedTrack?>(null) }
+    var overflowMenuOpen by remember { mutableStateOf(false) }
+    val syncedPlaylistIds by viewModel.syncedPlaylistIds.collectAsStateWithLifecycle()
+    var sortMenuOpen by remember { mutableStateOf(false) }
+    val savedSort = remember(playlistId) { PlaylistSortMemory.load(context, playlistId) }
+    var currentSort by remember(playlistId) { mutableStateOf(savedSort.first) }
+    var sortAscending by remember(playlistId) { mutableStateOf(savedSort.second) }
+    var isReorderLocked by remember { mutableStateOf(true) }
+    var searchQuery by remember { mutableStateOf("") }
+    var isSearchActive by remember { mutableStateOf(false) }
+
+    val displayTracks = remember(playlist.tracks, currentSort, sortAscending, searchQuery) {
+        val sorted = when (currentSort) {
+            PlaylistTrackSort.CUSTOM -> if (sortAscending) playlist.tracks else playlist.tracks.reversed()
+            PlaylistTrackSort.DATE_ADDED -> if (sortAscending) playlist.tracks else playlist.tracks.reversed()
+            PlaylistTrackSort.NAME -> if (sortAscending) {
+                playlist.tracks.sortedBy { it.name.lowercase() }
+            } else {
+                playlist.tracks.sortedByDescending { it.name.lowercase() }
+            }
+            PlaylistTrackSort.ARTIST -> if (sortAscending) {
+                playlist.tracks.sortedBy { it.artist.lowercase() }
+            } else {
+                playlist.tracks.sortedByDescending { it.artist.lowercase() }
+            }
+            PlaylistTrackSort.PLAY_TIME -> if (sortAscending) {
+                playlist.tracks.sortedBy { it.playcount ?: it.listeners ?: 0L }
+            } else {
+                playlist.tracks.sortedByDescending { it.playcount ?: it.listeners ?: 0L }
+            }
+        }
+        if (searchQuery.isNotBlank()) {
+            val q = searchQuery.lowercase()
+            sorted.filter { it.name.lowercase().contains(q) || it.artist.lowercase().contains(q) }
+        } else {
+            sorted
+        }
+    }
+
+    val listState = rememberLazyListState()
+    val dragScope = rememberCoroutineScope()
+    var draggingIndex by remember(playlistId) { mutableIntStateOf(-1) }
+    var dragOffsetY by remember(playlistId) { mutableFloatStateOf(0f) }
+    // Single throttled edge auto-scroll job. The old code launched a fresh
+    // `dragScope.launch { scrollBy() }` on EVERY drag callback inside the edge
+    // zone — dozens of concurrent scrollBy() mutators racing layoutInfo reads
+    // and moveTrack() recompositions, which kills the app at the viewport edge.
+    var edgeScrollJob by remember(playlistId) { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    fun cancelEdgeScroll() {
+        edgeScrollJob?.cancel()
+        edgeScrollJob = null
+    }
+    // Permanent reorder only makes sense on the stored order: Custom (ascending)
+    // on a local playlist with the lock opened.
+    val reorderEnabled = !isReorderLocked &&
+        !playlist.isYouTubeOnly &&
+        currentSort == PlaylistTrackSort.CUSTOM &&
+        sortAscending
+    // Stable content keys aligned to the DISPLAYED order (not playlist.tracks
+    // order) so animateItem() never sees duplicate or shifting keys at the
+    // scroll edge. The old code built keys from playlist.tracks but consumed
+    // them by displayTracks index — reversed/sorted lists then reused the
+    // wrong key per row, which crashes Lazy layout ("key was already used" /
+    // anchor out of bounds) on fast edge flings. Duplicates get occurrence
+    // suffixes; album disambiguates same name+artist across releases.
+    val displayKeys = remember(displayTracks) {
+        val counts = mutableMapOf<String, Int>()
+        displayTracks.map { track ->
+            val base = if (track.url.isNotBlank()) {
+                "url:${track.url}"
+            } else {
+                "t:${track.name.lowercase()}|${track.artist.lowercase()}|${track.album?.lowercase().orEmpty()}"
+            }
+            val n = counts.getOrDefault(base, 0)
+            counts[base] = n + 1
+            "$base#$n"
+        }
+    }
+    LaunchedEffect(playlist.tracks.size, displayTracks.size) {
+        if (draggingIndex < 0 || draggingIndex >= displayTracks.size) {
+            cancelEdgeScroll()
+            draggingIndex = -1
+            dragOffsetY = 0f
+        }
+    }
+    val scrollOffset by remember {
+        derivedStateOf {
+            if (listState.firstVisibleItemIndex == 0) {
+                listState.firstVisibleItemScrollOffset.toFloat()
+            } else 600f
+        }
+    }
+    val showScrolledHeader by remember {
+        derivedStateOf {
+            listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 240
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background),
+    ) {
+        // 1. Full-Bleed Cover Art Background at Top with smooth parallax physics
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(440.dp)
+                .graphicsLayer {
+                    translationY = -scrollOffset * 0.45f
+                    alpha = (1f - (scrollOffset / 520f)).coerceIn(0.1f, 1f)
+                    val zoom = 1f + (-scrollOffset.coerceAtMost(0f) / 600f)
+                    scaleX = zoom
+                    scaleY = zoom
+                },
+        ) {
+            PlaylistCover(
+                playlist = playlist,
+                modifier = Modifier.fillMaxSize(),
+                cornerRadius = 0.dp,
+            )
+            // Multi-stop cinematic dark gradient overlay
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            colorStops = arrayOf(
+                                0.0f to Color.Black.copy(alpha = 0.55f),
+                                0.30f to Color.Black.copy(alpha = 0.20f),
+                                0.60f to Color.Black.copy(alpha = 0.55f),
+                                0.85f to MaterialTheme.colorScheme.background.copy(alpha = 0.90f),
+                                1.0f to MaterialTheme.colorScheme.background,
+                            ),
+                        ),
+                    ),
+            )
+        }
+
+        LazyColumn(
+            state = listState,
+            contentPadding = PaddingValues(
+                start = 16.dp,
+                end = 16.dp,
+                top = 0.dp,
+                bottom = FloatingNavDefaults.contentBottomPadding(),
+            ),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+            modifier = Modifier
+                .fillMaxSize()
+                .adaptiveContentWidth(maxWidth = 860.dp)
+                .align(Alignment.TopCenter),
+        ) {
+            // Hero Header Section
+            item(key = "hero_section") {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 150.dp)
+                        .padding(horizontal = 4.dp),
+                ) {
+                    // Big Bold Playlist Title (overlaid in hero)
+                    Text(
+                        text = playlist.title,
+                        style = MaterialTheme.typography.headlineLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+
+                    Spacer(Modifier.height(8.dp))
+
+                    // Metadata line (tracks count & date)
+                    Text(
+                        text = if (playlist.isYouTubeOnly) {
+                            playlist.remoteTrackCount?.let { stringResource(com.nlx.music.R.string.pd_yt_subtitle, "$it") } ?: stringResource(com.nlx.music.R.string.pd_yt_only)
+                        } else {
+                            stringResource(com.nlx.music.R.string.pd_subtitle_local, playlist.tracks.size, formatDate(playlist.createdAtMillis))
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+
+                    Spacer(Modifier.height(18.dp))
+
+                    // Hero Action Buttons (Shuffle • Big Play Pill)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        // Circular Shuffle Button
+                        FilledTonalIconButton(
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                if (isThisPlaylistPlaying) {
+                                    musicPlayer.toggleShuffle()
+                                } else if (displayTracks.isNotEmpty()) {
+                                    val playableTracks = displayTracks.map(GeneratedTrack::toPlayableTrack)
+                                    val randomIndex = playableTracks.indices.random()
+                                    musicPlayer.playQueue(
+                                        playableTracks,
+                                        startIndex = randomIndex,
+                                        sourceLabel = playlist.title,
+                                        startShuffled = true,
+                                    )
+                                }
+                            },
+                            shape = CircleShape,
+                            colors = IconButtonDefaults.filledTonalIconButtonColors(
+                                containerColor = if (isThisPlaylistPlaying && playbackState.shuffleEnabled) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.secondaryContainer
+                                },
+                                contentColor = if (isThisPlaylistPlaying && playbackState.shuffleEnabled) {
+                                    MaterialTheme.colorScheme.onPrimary
+                                } else {
+                                    MaterialTheme.colorScheme.onSecondaryContainer
+                                },
+                            ),
+                            modifier = Modifier.size(50.dp),
+                        ) {
+                            Icon(Icons.Filled.Shuffle, contentDescription = stringResource(com.nlx.music.R.string.pd_shuffle_cd), modifier = Modifier.size(22.dp))
+                        }
+                        // Prominent Center Play / Playing Pill Button with Spring Physics
+                        val playInteractionSource = remember { MutableInteractionSource() }
+                        val isPlayPressed by playInteractionSource.collectIsPressedAsState()
+                        val playScale by animateFloatAsState(
+                            targetValue = if (isPlayPressed) 0.92f else 1f,
+                            animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium),
+                            label = "heroPlayScale",
+                        )
+
+                        Button(
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                if (playlist.tracks.isNotEmpty()) {
+                                    musicPlayer.playQueue(
+                                        displayTracks.map(GeneratedTrack::toPlayableTrack),
+                                        startIndex = 0,
+                                        sourceLabel = playlist.title,
+                                    )
+                                }
+                            },
+                            interactionSource = playInteractionSource,
+                            shape = CircleShape,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.primary,
+                                contentColor = MaterialTheme.colorScheme.onPrimary,
+                            ),
+                            elevation = ButtonDefaults.buttonElevation(defaultElevation = 4.dp, pressedElevation = 8.dp),
+                            modifier = Modifier
+                                .height(50.dp)
+                                .padding(horizontal = 4.dp)
+                                .graphicsLayer {
+                                    scaleX = playScale
+                                    scaleY = playScale
+                                },
+                        ) {
+                            Icon(
+                                if (isThisPlaylistPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                contentDescription = null,
+                                modifier = Modifier.size(26.dp),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                if (isThisPlaylistPlaying) stringResource(com.nlx.music.R.string.pd_playing) else stringResource(com.nlx.music.R.string.pd_play),
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                        // Locate current song
+                        FilledTonalIconButton(
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                val playingTrack = playbackState.current
+                                if (playingTrack != null && isThisPlaylistPlaying) {
+                                    val index = displayTracks.indexOfFirst { it.name.equals(playingTrack.title, ignoreCase = true) && it.artist.equals(playingTrack.artist, ignoreCase = true) }
+                                    if (index >= 0) {
+                                        dragScope.launch { listState.animateScrollToItem(index + 1) } // +1 for the hero section
+                                    }
+                                }
+                            },
+                            shape = CircleShape,
+                            colors = IconButtonDefaults.filledTonalIconButtonColors(
+                                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                            ),
+                            modifier = Modifier.size(50.dp),
+                        ) {
+                            Icon(Icons.Rounded.MyLocation, contentDescription = stringResource(com.nlx.music.R.string.pd_locate_cd), modifier = Modifier.size(22.dp))
+                        }
+                    }
+
+                    if (playlist.mode == LOCAL_SONGS_MODE) {
+                        Spacer(Modifier.height(14.dp))
+                        LocalSongsPanel(trackCount = playlist.tracks.size)
+                    }
+
+                    Spacer(Modifier.height(18.dp))
+
+                    // Sort Filter Pill & Lock Icon Row (Custom order, Date added, Name, Artist, Play time)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box {
+                            Surface(
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    sortMenuOpen = true
+                                },
+                                shape = RoundedCornerShape(50),
+                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f),
+                                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                                tonalElevation = 2.dp,
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 9.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    Text(
+                                        text = stringResource(currentSort.labelRes),
+                                        style = MaterialTheme.typography.labelLarge,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    Icon(
+                                        imageVector = if (sortAscending) Icons.Filled.ArrowUpward else Icons.Filled.ArrowDownward,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                }
+                            }
+
+                            DropdownMenu(
+                                expanded = sortMenuOpen,
+                                onDismissRequest = { sortMenuOpen = false },
+                                shape = RoundedCornerShape(20.dp),
+                                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                                tonalElevation = 6.dp,
+                                shadowElevation = 10.dp,
+                                modifier = Modifier.widthIn(min = 210.dp),
+                            ) {
+                                PlaylistTrackSort.entries.forEach { option ->
+                                    val isSelected = currentSort == option
+                                    DropdownMenuItem(
+                                        text = {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically,
+                                            ) {
+                                                Text(
+                                                    text = stringResource(option.labelRes),
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                                    color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                                                )
+                                                Spacer(Modifier.width(16.dp))
+                                                Icon(
+                                                    imageVector = when {
+                                                        isSelected && !sortAscending -> Icons.Filled.ArrowDownward
+                                                        isSelected && sortAscending -> Icons.Filled.ArrowUpward
+                                                        else -> Icons.Filled.SwapVert
+                                                    },
+                                                    contentDescription = null,
+                                                    tint = if (isSelected) {
+                                                        MaterialTheme.colorScheme.primary
+                                                    } else {
+                                                        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                                                    },
+                                                    modifier = Modifier.size(18.dp),
+                                                )
+                                            }
+                                        },
+                                        onClick = {
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            if (currentSort == option) {
+                                                sortAscending = !sortAscending
+                                            } else {
+                                                currentSort = option
+                                                sortAscending = option != PlaylistTrackSort.PLAY_TIME
+                                            }
+                                            PlaylistSortMemory.save(context, playlistId, currentSort, sortAscending)
+                                            sortMenuOpen = false
+                                        },
+                                    )
+                                }
+                            }
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                if (playlist.isYouTubeOnly) {
+                                    playlist.remoteTrackCount?.let { stringResource(com.nlx.music.R.string.pd_track_count, it) } ?: stringResource(com.nlx.music.R.string.pd_tracks_label)
+                                } else {
+                                    stringResource(com.nlx.music.R.string.pd_track_count, playlist.tracks.size)
+                                },
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            IconButton(
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    isReorderLocked = !isReorderLocked
+                                },
+                                modifier = Modifier.size(36.dp),
+                            ) {
+                                Icon(
+                                    imageVector = if (isReorderLocked) Icons.Filled.Lock else Icons.Filled.LockOpen,
+                                    contentDescription = if (isReorderLocked) stringResource(com.nlx.music.R.string.pd_reorder_locked_cd) else stringResource(com.nlx.music.R.string.pd_reorder_unlocked_cd),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                            }
+                        }
+                    }
+
+                    AnimatedVisibility(
+                        visible = isSearchActive,
+                        enter = expandVertically() + fadeIn(),
+                        exit = shrinkVertically() + fadeOut(),
+                    ) {
+                        androidx.compose.material3.OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            placeholder = { Text(stringResource(com.nlx.music.R.string.pd_search_hint)) },
+                            leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+                            trailingIcon = {
+                                if (searchQuery.isNotEmpty()) {
+                                    IconButton(onClick = { searchQuery = "" }) {
+                                        Icon(Icons.Filled.Close, contentDescription = stringResource(com.nlx.music.R.string.pd_clear_search_cd))
+                                    }
+                                }
+                            },
+                            shape = RoundedCornerShape(12.dp),
+                            singleLine = true,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp),
+                            colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = MaterialTheme.colorScheme.primary,
+                                unfocusedBorderColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
+                                focusedContainerColor = MaterialTheme.colorScheme.surfaceContainer,
+                                unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainer,
+                            ),
+                        )
+                    }
+
+                    Spacer(Modifier.height(6.dp))
+                }
+            }
+
+            // Track items
+            if (displayTracks.isEmpty()) {
+                item(key = "empty_tracks", contentType = "empty") {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 48.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (state.isDetailLoading) {
+                            ExpressiveLoadingIndicator(message = stringResource(com.nlx.music.R.string.pd_loading))
+                        } else {
+                            Text(
+                                stringResource(com.nlx.music.R.string.pd_empty),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            } else {
+                if (!isReorderLocked && !reorderEnabled && !playlist.isYouTubeOnly && displayTracks.size > 1) {
+                    item(key = "reorder_sort_hint", contentType = "hint") {
+                        Text(
+                            stringResource(com.nlx.music.R.string.pd_reorder_hint),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+                        )
+                    }
+                }
+                itemsIndexed(
+                    items = displayTracks,
+                    key = { index, track ->
+                        displayKeys.getOrNull(index) ?: "pos_${track.url.ifBlank { "${track.name}_${track.artist}" }}_$index"
+                    },
+                    contentType = { _, _ -> "playlist_track" },
+                ) { index, track ->
+                    val isPlayingThisSong = playbackState.isPlaying &&
+                        playbackState.current?.title.equals(track.name, ignoreCase = true) &&
+                        playbackState.current?.artist.equals(track.artist, ignoreCase = true)
+                    val isDragging = reorderEnabled && index == draggingIndex
+                    val stableKey = displayKeys.getOrNull(index) ?: "pos_${track.url.ifBlank { "${track.name}_${track.artist}" }}_$index"
+
+                    Box(
+                        modifier = Modifier
+                            .animateItem()
+                            .zIndex(if (isDragging) 1f else 0f)
+                            .graphicsLayer {
+                                translationY = if (isDragging) dragOffsetY else 0f
+                                shadowElevation = if (isDragging) 18f else 0f
+                                val s = if (isDragging) 1.025f else 1f
+                                scaleX = s
+                                scaleY = s
+                                alpha = if (isDragging) 0.96f else 1f
+                            },
+                    ) {
+                        NativeTrackRow(
+                            index = index + 1,
+                            track = track,
+                            isPlaying = isPlayingThisSong,
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                if (displayTracks.isEmpty()) return@NativeTrackRow
+                                // index is from composition time; the list can
+                                // shrink (remove/move) before the tap lands —
+                                // an OOB startIndex crashed playback at the edge.
+                                val safeIndex = index.coerceIn(displayTracks.indices)
+                                runCatching {
+                                    musicPlayer.playQueue(
+                                        displayTracks.map(GeneratedTrack::toPlayableTrack),
+                                        startIndex = safeIndex,
+                                        sourceLabel = playlist.title,
+                                        startShuffled = playbackState.shuffleEnabled,
+                                    )
+                                }
+                            },
+                            onMenu = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                menuTarget = track
+                            },
+                            dragHandle = if (!reorderEnabled) {
+                                null
+                            } else {
+                                {
+                                    Icon(
+                                        Icons.Filled.DragHandle,
+                                        stringResource(com.nlx.music.R.string.queue_drag_hint),
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (isDragging) 1f else 0.6f),
+                                        modifier = Modifier
+                                            .padding(start = 4.dp)
+                                            .size(40.dp)
+                                            .clip(RoundedCornerShape(14.dp))
+                                            .background(
+                                                if (isDragging) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+                                                else MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.6f),
+                                            )
+                                            .padding(8.dp)
+                                            .pointerInput(stableKey) {
+                                                detectDragGestures(
+                                                    onDragStart = {
+                                                        draggingIndex = index
+                                                        dragOffsetY = 0f
+                                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                    },
+                                                    onDragEnd = {
+                                                        cancelEdgeScroll()
+                                                        draggingIndex = -1
+                                                        dragOffsetY = 0f
+                                                    },
+                                                    onDragCancel = {
+                                                        cancelEdgeScroll()
+                                                        draggingIndex = -1
+                                                        dragOffsetY = 0f
+                                                    },
+                                                    onDrag = { change, dragAmount ->
+                                                        change.consume()
+                                                        val source = draggingIndex
+                                                        if (source < 0 || source !in displayTracks.indices) {
+                                                            cancelEdgeScroll()
+                                                            return@detectDragGestures
+                                                        }
+                                                        dragOffsetY += dragAmount.y
+                                                        // layoutInfo can throw while the list is
+                                                        // recomposing under moveTrack(); never let a
+                                                        // scroll-edge read crash the app.
+                                                        val layoutInfo = runCatching { listState.layoutInfo }.getOrNull()
+                                                            ?: return@detectDragGestures
+                                                        val visible = runCatching { layoutInfo.visibleItemsInfo }.getOrNull()
+                                                            ?: return@detectDragGestures
+                                                        if (visible.isEmpty()) return@detectDragGestures
+                                                        val draggedInfo = visible
+                                                            .firstOrNull { it.index == source + 1 }
+                                                            ?: return@detectDragGestures
+                                                        val draggedCenter = draggedInfo.offset + draggedInfo.size / 2 + dragOffsetY.toInt()
+                                                        // +1 offsets the hero header item at position 0.
+                                                        val target = visible.firstOrNull { info ->
+                                                            val trackIndex = info.index - 1
+                                                            info.index != source + 1 &&
+                                                                trackIndex in displayTracks.indices &&
+                                                                draggedCenter in info.offset..(info.offset + info.size)
+                                                        }?.index?.minus(1)
+                                                        if (target != null && target != source && target in displayTracks.indices) {
+                                                            runCatching { viewModel.moveTrack(playlistId, source, target) }
+                                                            val targetInfo = runCatching {
+                                                                listState.layoutInfo.visibleItemsInfo
+                                                                    .firstOrNull { it.index == target + 1 }
+                                                            }.getOrNull()
+                                                            if (targetInfo != null) {
+                                                                dragOffsetY += (draggedInfo.offset - targetInfo.offset).toFloat()
+                                                            }
+                                                            draggingIndex = target
+                                                            runCatching { haptic.performHapticFeedback(HapticFeedbackType.SegmentFrequentTick) }
+                                                        }
+                                                        val viewportStart = runCatching { layoutInfo.viewportStartOffset }.getOrDefault(0)
+                                                        val viewportEnd = runCatching { layoutInfo.viewportEndOffset }.getOrDefault(0)
+                                                        if (viewportEnd <= viewportStart) {
+                                                            cancelEdgeScroll()
+                                                            return@detectDragGestures
+                                                        }
+                                                        val edgeZone = 180
+                                                        val direction = when {
+                                                            draggedCenter < viewportStart + edgeZone -> -1f
+                                                            draggedCenter > viewportEnd - edgeZone -> 1f
+                                                            else -> 0f
+                                                        }
+                                                        if (direction == 0f) {
+                                                            cancelEdgeScroll()
+                                                        } else if (edgeScrollJob?.isActive != true) {
+                                                            edgeScrollJob = dragScope.launch {
+                                                                runCatching { listState.scrollBy(direction * 28f) }
+                                                            }
+                                                        }
+                                                    },
+                                                )
+                                            },
+                                    )
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+
+        // 2. Floating Top Bar with Frosted Glass styling & Smooth Scrolled Header
+        val topBarBg by animateColorAsState(
+            targetValue = if (showScrolledHeader) MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.98f) else Color.Transparent,
+            animationSpec = tween(260),
+            label = "topBarBg",
+        )
+        val topBarElevation by animateDpAsState(
+            targetValue = if (showScrolledHeader) 6.dp else 0.dp,
+            animationSpec = tween(260),
+            label = "topBarElevation",
+        )
+
+        Surface(
+            color = topBarBg,
+            tonalElevation = topBarElevation,
+            shadowElevation = topBarElevation,
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.TopCenter),
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .adaptiveContentWidth(maxWidth = 860.dp)
+                    .windowInsetsPadding(WindowInsets.statusBars)
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                // Circular back button
+                IconButton(
+                    onClick = onBack,
+                    modifier = Modifier
+                        .size(42.dp)
+                        .background(
+                            if (showScrolledHeader) Color.Transparent else Color.Black.copy(alpha = 0.38f),
+                            CircleShape,
+                        ),
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = stringResource(com.nlx.music.R.string.pd_back_cd),
+                        tint = if (showScrolledHeader) MaterialTheme.colorScheme.onSurface else Color.White,
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    AnimatedVisibility(
+                        visible = showScrolledHeader,
+                        enter = fadeIn() + scaleIn(initialScale = 0.9f),
+                        exit = fadeOut() + scaleOut(targetScale = 0.9f),
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(modifier = Modifier.size(32.dp)) {
+                                PlaylistCover(
+                                    playlist = playlist,
+                                    modifier = Modifier.fillMaxSize(),
+                                    cornerRadius = 8.dp,
+                                )
+                            }
+                            Spacer(Modifier.width(10.dp))
+                            // Removed LocationOn icon
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = playlist.title,
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+
+                AnimatedVisibility(
+                    visible = showScrolledHeader && playlist.tracks.isNotEmpty(),
+                    enter = fadeIn() + scaleIn(),
+                    exit = fadeOut() + scaleOut(),
+                ) {
+                    FilledTonalIconButton(
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            val playingTrack = playbackState.current
+                            if (playingTrack != null && isThisPlaylistPlaying) {
+                                val index = displayTracks.indexOfFirst { it.name.equals(playingTrack.title, ignoreCase = true) && it.artist.equals(playingTrack.artist, ignoreCase = true) }
+                                if (index >= 0) {
+                                    dragScope.launch { listState.animateScrollToItem(index + 1) }
+                                }
+                            }
+                        },
+                        shape = CircleShape,
+                        colors = IconButtonDefaults.filledTonalIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                        ),
+                        modifier = Modifier.size(38.dp),
+                    ) {
+                        Icon(Icons.Rounded.MyLocation, contentDescription = stringResource(com.nlx.music.R.string.pd_locate_cd), modifier = Modifier.size(16.dp))
+                    }
+                }
+
+                Spacer(Modifier.width(6.dp))
+
+                // Translucent Actions Pill (Search / More Menu)
+                Surface(
+                    shape = RoundedCornerShape(50),
+                    color = if (showScrolledHeader) Color.Transparent else Color.Black.copy(alpha = 0.38f),
+                ) {
+                    Row {
+                        IconButton(
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                isSearchActive = !isSearchActive
+                                if (!isSearchActive) searchQuery = ""
+                            },
+                            modifier = Modifier.size(42.dp),
+                        ) {
+                            Icon(
+                                Icons.Filled.Search,
+                                contentDescription = stringResource(com.nlx.music.R.string.pd_search_cd),
+                                tint = if (isSearchActive) MaterialTheme.colorScheme.primary else if (showScrolledHeader) MaterialTheme.colorScheme.onSurface else Color.White,
+                            )
+                        }
+                        Box {
+                            IconButton(
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    overflowMenuOpen = true
+                                },
+                                modifier = Modifier.size(42.dp),
+                            ) {
+                                Icon(
+                                    Icons.Filled.MoreVert,
+                                    contentDescription = stringResource(com.nlx.music.R.string.pd_options_cd),
+                                    tint = if (showScrolledHeader) MaterialTheme.colorScheme.onSurface else Color.White,
+                                )
+                            }
+
+                        DropdownMenu(
+                            expanded = overflowMenuOpen,
+                            onDismissRequest = { overflowMenuOpen = false },
+                            shape = RoundedCornerShape(24.dp),
+                            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            tonalElevation = 6.dp,
+                            shadowElevation = 12.dp,
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text(if (playlist.isPinned) stringResource(com.nlx.music.R.string.pd_unpin) else stringResource(com.nlx.music.R.string.pd_pin_top)) },
+                                leadingIcon = { Icon(Icons.Filled.PushPin, contentDescription = null) },
+                                onClick = {
+                                    viewModel.togglePinned(playlistId)
+                                    overflowMenuOpen = false
+                                },
+                            )
+                            val isLocalSongs = playlist.mode == LOCAL_SONGS_MODE
+                            if (!isLocalSongs) DropdownMenuItem(
+                                text = { Text(stringResource(com.nlx.music.R.string.pl_download_all)) },
+                                leadingIcon = { Icon(Icons.Filled.Download, contentDescription = null) },
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    viewModel.downloadPlaylist(playlistId)
+                                    overflowMenuOpen = false
+                                },
+                            )
+                            if (!isLocalSongs) DropdownMenuItem(
+                                text = { Text(stringResource(com.nlx.music.R.string.pd_cancel_downloads)) },
+                                leadingIcon = { Icon(Icons.Filled.Close, contentDescription = null) },
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    viewModel.cancelPlaylistDownloads(playlistId)
+                                    overflowMenuOpen = false
+                                },
+                            )
+                            if (playlist.isYouTubeOnly) {
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(com.nlx.music.R.string.pl_make_local)) },
+                                    leadingIcon = { Icon(Icons.Filled.BookmarkAdd, contentDescription = null) },
+                                    onClick = {
+                                        viewModel.makeLocal(playlistId)
+                                        overflowMenuOpen = false
+                                    },
+                                )
+                            } else {
+                                if (playlist.mode != LIKED_SONGS_MODE && !isLocalSongs) {
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                if (state.regeneratingId == playlistId) stringResource(com.nlx.music.R.string.pl_regenerating)
+                                                else stringResource(com.nlx.music.R.string.pd_regenerate_playlist),
+                                            )
+                                        },
+                                        leadingIcon = {
+                                            Icon(
+                                                Icons.Filled.Refresh,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.primary,
+                                            )
+                                        },
+                                        enabled = state.regeneratingId == null,
+                                        onClick = {
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            viewModel.regenerate(playlistId) { newId ->
+                                                onOpenPlaylist?.invoke(newId)
+                                            }
+                                            overflowMenuOpen = false
+                                        },
+                                    )
+                                }
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(com.nlx.music.R.string.pd_change_cover)) },
+                                    leadingIcon = { Icon(Icons.Filled.PhotoLibrary, contentDescription = null) },
+                                    onClick = {
+                                        coverEditorOpen = true
+                                        overflowMenuOpen = false
+                                    },
+                                )
+                                if (playlist.mode != LIKED_SONGS_MODE) {
+                                    DropdownMenuItem(
+                                        text = { Text(stringResource(com.nlx.music.R.string.pl_rename_title)) },
+                                        leadingIcon = { Icon(Icons.Filled.Edit, contentDescription = null) },
+                                        onClick = {
+                                            viewModel.requestRename(playlistId)
+                                            overflowMenuOpen = false
+                                        },
+                                    )
+                                }
+                            }
+                            DropdownMenuItem(
+                                text = { Text(stringResource(com.nlx.music.R.string.pd_export_share)) },
+                                leadingIcon = { Icon(Icons.Filled.Share, contentDescription = null) },
+                                onClick = {
+                                    viewModel.openExportSheet(playlistId)
+                                    overflowMenuOpen = false
+                                },
+                            )
+                            if (!playlist.isYouTubeOnly && !isLocalSongs) {
+                                val isSyncedToYt = syncedPlaylistIds == null || playlistId in (syncedPlaylistIds ?: emptySet())
+                                DropdownMenuItem(
+                                    text = { Text(if (isSyncedToYt) stringResource(com.nlx.music.R.string.pd_syncing_yt) else stringResource(com.nlx.music.R.string.pd_sync_yt)) },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Filled.CloudSync,
+                                            contentDescription = null,
+                                            tint = if (isSyncedToYt) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    },
+                                    onClick = {
+                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        viewModel.toggleYtSync(playlistId)
+                                        overflowMenuOpen = false
+                                    },
+                                )
+                            }
+                                if (!isLocalSongs) DropdownMenuItem(
+                                    text = { Text(stringResource(com.nlx.music.R.string.pd_delete_item), color = MaterialTheme.colorScheme.error) },
+                                    leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
+                                    onClick = {
+                                        viewModel.requestDelete(playlistId)
+                                        overflowMenuOpen = false
+                                    },
+                                )
+                        }
+                    }
+                    }
+                }
+            }
+        }
+
+        AnimatedVisibility(
+            visible = state.regeneratingId == playlistId,
+            enter = fadeIn() + scaleIn(),
+            exit = fadeOut() + scaleOut(),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = FloatingNavDefaults.contentBottomPadding() + 12.dp),
+        ) {
+            Surface(
+                shape = ExpressivePillShape,
+                color = MaterialTheme.colorScheme.inverseSurface,
+                shadowElevation = 8.dp,
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    com.nlx.music.ui.common.ExpressiveInlineLoadingIndicator(
+                        size = 20.dp,
+                        color = MaterialTheme.colorScheme.inverseOnSurface,
+                        strokeWidth = 2.dp,
+                    )
+                    Text(
+                        stringResource(com.nlx.music.R.string.pd_building),
+                        color = MaterialTheme.colorScheme.inverseOnSurface,
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                }
+            }
+        }
+
+        // Toasts
+        state.toastMessage?.let { msg ->
+            LaunchedEffect(msg) {
+                kotlinx.coroutines.delay(3000)
+                viewModel.dismissToast()
+            }
+            Surface(
+                shape = ExpressivePillShape,
+                color = MaterialTheme.colorScheme.inverseSurface,
+                shadowElevation = 8.dp,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = FloatingNavDefaults.contentBottomPadding() + 12.dp),
+            ) {
+                Text(
+                    msg,
+                    color = MaterialTheme.colorScheme.inverseOnSurface,
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
+                )
+            }
+        }
+    }
+
+    // Cover Editor Dialog
+    if (coverEditorOpen) {
+        AlertDialog(
+            onDismissRequest = { coverEditorOpen = false },
+            title = { Text(stringResource(com.nlx.music.R.string.pl_cover_title)) },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    PlaylistCover(playlist = playlist, modifier = Modifier.size(140.dp), cornerRadius = 26.dp)
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        if (playlist.customCoverUri.isNullOrBlank()) {
+                            stringResource(com.nlx.music.R.string.pl_cover_auto_desc)
+                        } else {
+                            stringResource(com.nlx.music.R.string.pl_cover_custom_desc)
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        coverPickerPending = true
+                        coverEditorOpen = false
+                        coverPicker.launch(arrayOf("image/*"))
+                    },
+                ) {
+                    Text(if (playlist.customCoverUri.isNullOrBlank()) stringResource(com.nlx.music.R.string.pl_choose_image) else stringResource(com.nlx.music.R.string.pl_change_image))
+                }
+            },
+            dismissButton = {
+                Row {
+                    if (!playlist.customCoverUri.isNullOrBlank()) {
+                        TextButton(
+                            onClick = {
+                                viewModel.setCustomCover(playlistId, null)
+                                coverEditorOpen = false
+                            },
+                        ) { Text(stringResource(com.nlx.music.R.string.pl_use_automatic)) }
+                    }
+                    TextButton(onClick = { coverEditorOpen = false }) { Text(stringResource(com.nlx.music.R.string.common_done)) }
+                }
+            },
+        )
+    }
+
+    // Delete confirmation dialog
+    if (state.deleteConfirmForPlaylistId != null) {
+        AlertDialog(
+            onDismissRequest = viewModel::dismissDeleteConfirm,
+            title = { Text(stringResource(com.nlx.music.R.string.pd_delete_title)) },
+            text = { Text(stringResource(com.nlx.music.R.string.pd_delete_text, playlist.title)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.confirmDelete()
+                    onBack()
+                }) { Text(stringResource(com.nlx.music.R.string.common_delete), color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = viewModel::dismissDeleteConfirm) { Text(stringResource(com.nlx.music.R.string.common_cancel)) } },
+        )
+    }
+
+    // Rename dialog
+    state.renamePlaylistId?.let { id ->
+        var title by remember(id) { mutableStateOf(playlist.title) }
+        AlertDialog(
+            onDismissRequest = viewModel::dismissRename,
+            title = { Text(stringResource(com.nlx.music.R.string.pl_rename_title)) },
+            text = {
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    label = { Text(stringResource(com.nlx.music.R.string.pl_name_label)) },
+                    singleLine = true,
+                    shape = RoundedCornerShape(16.dp),
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { viewModel.renamePlaylist(title) }, enabled = title.isNotBlank()) { Text(stringResource(com.nlx.music.R.string.common_save)) }
+            },
+            dismissButton = { TextButton(onClick = viewModel::dismissRename) { Text(stringResource(com.nlx.music.R.string.common_cancel)) } },
+        )
+    }
+
+    // Export bottom sheet
+    state.exportSheetForPlaylistId?.let { id ->
+        ExportBottomSheet(
+            onDismiss = viewModel::dismissExportSheet,
+            onSaveCsv = { viewModel.exportSave(id, ExportFormat.CSV) },
+            onSaveM3u = { viewModel.exportSave(id, ExportFormat.M3U) },
+            onShareCsv = { viewModel.exportShare(id, ExportFormat.CSV) },
+            onShareM3u = { viewModel.exportShare(id, ExportFormat.M3U) },
+        )
+    }
+
+    // Track Context Menu
+    menuTarget?.let { track ->
+        TrackContextMenuSheet(
+            target = TrackMenuTarget.Track(track.name, track.artist, track.url),
+            capabilities = TrackMenuCapabilities(showCopyActions = true, showDeleteScrobble = true),
+            // Keep the file path so menu actions play / add the local copy.
+            playableTrack = track.takeIf { it.isLocalFile() }?.toPlayableTrack(),
+            playbackSourceLabel = playlist.title,
+            onDismiss = { menuTarget = null },
+            onRemoveFromPlaylist = {
+                val realIndex = playlist.tracks.indexOfFirst {
+                    (it.url.isNotBlank() && it.url == track.url) ||
+                        (it.name.equals(track.name, ignoreCase = true) && it.artist.equals(track.artist, ignoreCase = true))
+                }
+                if (realIndex >= 0) {
+                    viewModel.removeTrack(playlistId, realIndex)
+                }
+            },
+            onDeleteScrobble = { name, artist -> viewModel.deleteScrobble(name, artist) },
+            onRefreshArtwork = { viewModel.refreshArtwork(track.name, track.artist) },
+        )
+    }
+}
+
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun NativeTrackRow(
+    index: Int,
+    track: GeneratedTrack,
+    isPlaying: Boolean,
+    onClick: () -> Unit,
+    onMenu: () -> Unit,
+    dragHandle: (@Composable () -> Unit)? = null,
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val rowScale by animateFloatAsState(
+        targetValue = if (isPressed) 0.98f else 1f,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium),
+        label = "rowPress",
+    )
+    val rowBackground by animateColorAsState(
+        targetValue = if (isPlaying) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f) else Color.Transparent,
+        animationSpec = tween(350),
+        label = "rowBg",
+    )
+
+    val rowModifier = if (isPlaying) {
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(
+                Brush.horizontalGradient(
+                    listOf(
+                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f),
+                        MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.85f),
+                    ),
+                ),
+            )
+            .graphicsLayer {
+                scaleX = rowScale
+                scaleY = rowScale
+            }
+    } else {
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .graphicsLayer {
+                scaleX = rowScale
+                scaleY = rowScale
+            }
+    }
+
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = Color.Transparent,
+        modifier = rowModifier,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .combinedClickable(
+                    interactionSource = interactionSource,
+                    indication = null,
+                    onClick = onClick,
+                    onLongClick = if (dragHandle != null) null else onMenu,
+                )
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // Track index or playing animation
+            Box(
+                modifier = Modifier.width(36.dp),
+                contentAlignment = Alignment.CenterStart,
+            ) {
+                Text(
+                    text = "$index",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.outline,
+                    maxLines = 1,
+                    overflow = TextOverflow.Visible,
+                )
+            }
+            Spacer(Modifier.width(6.dp))
+            Box(Modifier.size(48.dp).clip(ArtworkShape)) {
+                ArtworkImage(
+                    name = track.name,
+                    artist = track.artist,
+                    embeddedUrl = track.artworkUrl,
+                    fallbackIcon = Icons.Filled.MusicNote,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                if (isPlaying) {
+                    com.nlx.music.ui.player.PlayingWaveBars(
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(2.dp).size(24.dp, 18.dp),
+                    )
+                }
+            }
+
+            Spacer(Modifier.width(14.dp))
+
+            // Title & Artist
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = track.name,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = if (isPlaying) FontWeight.Bold else FontWeight.SemiBold,
+                    color = if (isPlaying) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = track.artist,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+
+            // Now Playing badge if active
+            if (isPlaying) {
+                val transition = rememberInfiniteTransition(label = "nowPlayingAnim")
+                val pulseScale by transition.animateFloat(
+                    initialValue = 1.0f,
+                    targetValue = 1.06f,
+                    animationSpec = infiniteRepeatable(tween(1200, easing = LinearEasing), RepeatMode.Reverse),
+                    label = "pulseScale",
+                )
+                val dotAlpha by transition.animateFloat(
+                    initialValue = 0.45f,
+                    targetValue = 1f,
+                    animationSpec = infiniteRepeatable(tween(800, easing = LinearEasing), RepeatMode.Reverse),
+                    label = "dotAlpha",
+                )
+                Surface(
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.primary,
+                    tonalElevation = 4.dp,
+                    shadowElevation = 2.dp,
+                    modifier = Modifier.graphicsLayer {
+                        scaleX = pulseScale
+                        scaleY = pulseScale
+                    },
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .graphicsLayer { alpha = dotAlpha }
+                                .background(MaterialTheme.colorScheme.onPrimary, CircleShape),
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "Now Playing",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        )
+                    }
+                }
+                Spacer(Modifier.width(4.dp))
+            }
+
+            // Drag handle (only when reorder is enabled by the caller)
+            dragHandle?.invoke()
+            // Options menu button
+            IconButton(
+                onClick = onMenu,
+                modifier = Modifier.size(36.dp),
+            ) {
+                Icon(
+                    Icons.Filled.MoreVert,
+                    contentDescription = stringResource(com.nlx.music.R.string.pd_song_options_cd),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.85f),
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
+    }
+}

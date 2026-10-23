@@ -1,0 +1,12 @@
+HSPLcom/nlx/music/MainActivity;->**(**)**
+HSPLcom/nlx/music/NlxMusicApplication;->**(**)**
+HSPLcom/nlx/music/ui/shell/**->**(**)**
+HSPLcom/nlx/music/ui/home/**->**(**)**
+HSPLcom/nlx/music/ui/settings/**->**(**)**
+HSPLcom/nlx/music/ui/player/**->**(**)**
+HSPLcom/nlx/music/ui/common/ArtworkImageKt;->**(**)**
+HSPLcom/nlx/music/ui/common/ExpressiveMotion;->**(**)**
+HSPLcom/nlx/music/playback/MusicPlayer;->**(**)**
+HSPLcom/nlx/music/playback/MusicPlaybackService;->**(**)**
+HSPLcom/nlx/music/data/artwork/ArtworkRepository;->**(**)**
+HSPLcom/nlx/music/ui/common/ExpressiveHeaderKt;->**(**)**

@@ -1,0 +1,1759 @@
+@file:OptIn(androidx.media3.common.util.UnstableApi::class)
+
+package com.nlx.music.playback
+
+import android.media.AudioDeviceInfo
+import android.media.AudioFormat
+import android.os.Build
+import android.util.Log
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.AuxEffectInfo
+import androidx.media3.common.C
+import androidx.media3.common.Format
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.PlaybackParameters
+import androidx.media3.common.audio.AudioProcessor
+import androidx.media3.common.util.Clock
+import androidx.media3.exoplayer.audio.AudioOffloadSupport
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
+/**
+ * Runs the optional native Float32 DSP in front of Media3 while keeping an
+ * independent, conservative [DefaultAudioSink] ready as the fail-open path.
+ * Devices that reject Float32 AudioTrack still receive the native DSP result;
+ * Media3 performs only the final Float32-to-PCM16 conversion. If native/JNI
+ * processing itself fails, the untouched source buffer is retried through the
+ * plain platform PCM path.
+ *
+ * Bit-Perfect clean path: when requested, decoded PCM of ANY depth
+ * (16/24/32-bit integer or Float) is handed to the platform sink untouched —
+ * no Float conversion, no libsoxr resampler, no DSP container, no AudioFX.
+ * The source sample rate therefore drives the opened AudioTrack directly.
+ */
+class NativeProcessingAudioSink(
+    private val enhancedDelegate: DefaultAudioSink,
+    private val fallbackDelegate: DefaultAudioSink,
+    private val processor: NativePcmAudioProcessor,
+    private val onPlatformEffectsRequired: (Boolean) -> Unit = {},
+    private val usbOutput: UsbBitPerfectOutput? = null,
+    private val exclusiveUsb: ExclusiveUsbOutput? = null,
+    /** Fork: AAudio exclusive (MMAP) output on the phone's own outputs. */
+    private val internalDirect: InternalDirectOutput? = null,
+) : AudioSink {
+    private var activeDelegate: DefaultAudioSink = fallbackDelegate
+    // Read on the main thread for the signal-path verdict, written on the
+    // renderer thread — volatile so bypass/stale reads never go stale.
+    @Volatile private var processingActive = false
+    private var floatOutputDisabled = false
+    private var nativePathDisabled = false
+    private var playing = false
+    @Volatile private var bitPerfectRequested = false
+    // Generation tracking so the verdict can separate bitPerfectRequested
+    // from bitPerfectActuallyActive: the flag only takes effect when the sink
+    // next configures (next track). A mid-track toggle leaves stale config.
+    @Volatile private var bitPerfectAtConfigure = false
+    @Volatile private var hasConfigured = false
+    @Volatile private var exclusiveWanted = false
+    @Volatile private var usbExclusive = false
+    @Volatile private var exclusiveStartFailed = false
+    @Volatile private var exclusiveEnded = false
+    /**
+     * Same-family fallback target for exclusive USB (e.g. 44.1 kHz for an
+     * 88.2 kHz source whose rate the DAC descriptor lacks), pushed per
+     * track from routing. Null = native source rate (today's behavior).
+     * Renderer thread only, like the rest of the exclusive state.
+     */
+    private var exclusiveFallbackRateHz: Int? = null
+    /** Source sample rate for which [exclusiveFallbackRateHz] was intended. */
+    private var exclusiveFallbackSourceRateHz: Int? = null
+    /** Source rate the exclusive converter is currently built for (0 = none). */
+    private var exclusiveConvertSourceHz = 0
+    /** Converted Float32 output awaiting USB queue space across calls. */
+    private var pendingUsbFloat: ByteBuffer? = null
+    private var pendingUsbPtsUs = 0L
+    /** Last output-rate override pushed for the AudioTrack path, restored
+     *  after the exclusive converter borrows the processor. */
+    private var requestedOutputOverrideHz: Int? = null
+
+    private var configuredFormat: Format? = null
+    private var configuredBufferSize = 0
+    private var configuredOutputChannels: IntArray? = null
+    private var processedFormat: Format? = null
+    private var outputChannelCount = 2
+
+    private var pendingInputLimit = 0
+    private var pendingOutput: ByteBuffer? = null
+    @Volatile
+    private var lastVolume = 1f
+    // Buffer already gain-scaled for the current direct-passthrough buffer
+    // (see handleDirectPassthrough). Renderer thread only.
+    private var lastGainBuffer: ByteBuffer? = null
+    private var pendingPresentationTimeUs = 0L
+    private var pendingAccessUnitCount = 0
+    private var pendingOutputFrameCount = 0
+    private var nextOutputPresentationTimeUs = 0L
+
+    private var endOfStreamQueued = false
+    private var endOfStreamOutput: ByteBuffer? = null
+
+    // Internal direct (no USB DAC) state. Mutually exclusive with usbExclusive:
+    // USB exclusive is tried first and the internal route refuses USB devices.
+    @Volatile private var internalWanted = false
+    @Volatile private var internalActive = false
+    @Volatile private var internalStartFailed = false
+    @Volatile private var internalEnded = false
+    /** soxr output waiting for room in the exclusive ring (resampled mode). */
+    private var pendingInternalFloat: ByteBuffer? = null
+    private var pendingInternalPtsUs = 0L
+    /** Channel count the shared converter emits while it serves internal direct. */
+    private var converterChannels = 2
+
+    /**
+     * AutoEQ on routes where PCM never enters the native Float32 DSP (USB
+     * exclusive, internal direct, Bit-Perfect AudioTrack, platform fallback).
+     * The converter / processed paths get the same EQ inside the native DSP.
+     */
+    private val directEq = com.nlx.music.playback.eq.DirectPcmEq()
+    /** Buffer already equalised: Media3 retries the same object until consumed. */
+    private var directEqBuffer: ByteBuffer? = null
+
+    var onConfiguredFormat: ((sampleRateHz: Int, pcmEncoding: Int, channelCount: Int) -> Unit)? = null
+    var bitDepthHintProvider: (() -> Int?)? = null
+
+    override fun setListener(listener: AudioSink.Listener) {
+        enhancedDelegate.setListener(listener)
+        fallbackDelegate.setListener(listener)
+    }
+
+    override fun setClock(clock: Clock) {
+        enhancedDelegate.setClock(clock)
+        fallbackDelegate.setClock(clock)
+    }
+
+    override fun supportsFormat(format: Format): Boolean =
+        getFormatSupport(format) != AudioSink.SINK_FORMAT_UNSUPPORTED
+
+    override fun getFormatSupport(format: Format): Int {
+        val fallbackSupport = fallbackDelegate.getFormatSupport(format)
+        if (nativePathDisabled || !processor.isAvailable || !canProcess(format)) {
+            return fallbackSupport
+        }
+        val floatSupport = enhancedDelegate.getFormatSupport(asFloatProbeFormat(format))
+        if (!floatOutputDisabled && floatSupport != AudioSink.SINK_FORMAT_UNSUPPORTED) {
+            return floatSupport
+        }
+        val processedPcm16Support = fallbackDelegate.getFormatSupport(asFloatProbeFormat(format))
+        return if (processedPcm16Support != AudioSink.SINK_FORMAT_UNSUPPORTED) {
+            processedPcm16Support
+        } else fallbackSupport
+    }
+
+    override fun getFormatOffloadSupport(format: Format): AudioOffloadSupport =
+        AudioOffloadSupport.DEFAULT_UNSUPPORTED
+
+    override fun getCurrentPositionUs(sourceEnded: Boolean): Long =
+        if (usbExclusive) {
+            exclusiveUsb?.getCurrentPositionUs() ?: AudioSink.CURRENT_POSITION_NOT_SET
+        } else if (internalActive) {
+            internalDirect?.getCurrentPositionUs() ?: AudioSink.CURRENT_POSITION_NOT_SET
+        } else {
+            activeDelegate.getCurrentPositionUs(sourceEnded)
+        }
+
+    override fun configure(format: Format, specifiedBufferSize: Int, outputChannels: IntArray?) {
+        configuredFormat = format
+        configuredBufferSize = specifiedBufferSize
+        configuredOutputChannels = outputChannels?.clone()
+        clearPending()
+        clearEndOfStream()
+        processingActive = false
+        processedFormat = null
+        hasConfigured = true
+        exclusiveStartFailed = false
+        exclusiveEnded = false
+        internalEnded = false
+        internalStartFailed = false
+        pendingInternalFloat = null
+        // A fallback target calculated for a previous track (e.g. 176.4 -> 192 kHz)
+        // must never leak into a subsequent track with a different native rate (e.g. 44.1 kHz).
+        if (exclusiveFallbackSourceRateHz != null && exclusiveFallbackSourceRateHz != format.sampleRate) {
+            clearExclusiveConverter()
+        }
+
+        if (format.sampleRate > 0) {
+            onConfiguredFormat?.invoke(format.sampleRate, format.pcmEncoding, format.channelCount)
+        }
+        directEqBuffer = null
+        if (format.sampleMimeType == MimeTypes.AUDIO_RAW && format.sampleRate > 0) {
+            directEq.configure(format.sampleRate, format.channelCount, format.pcmEncoding)
+        }
+
+        if (exclusiveWanted && internalDirect?.hasOpenStream() == true) {
+            // A direct AudioTrack left open on the DAC by the previous item
+            // keeps snd-usb-audio busy and would make the usbdevfs claim fail.
+            internalActive = false
+            runCatching { internalDirect?.reset() }
+        }
+        if (tryConfigureExclusiveUsb(format)) {
+            internalActive = false
+            bitPerfectAtConfigure = true
+            return
+        }
+        // A previous item may have run direct; this one renegotiates below.
+        internalActive = false
+        if (tryConfigureInternalDirect(format)) {
+            bitPerfectAtConfigure = bitPerfectRequested
+            return
+        }
+        // Not engaging this time: never keep the exclusive endpoint reserved.
+        if (internalDirect?.hasOpenStream() == true) runCatching { internalDirect?.reset() }
+
+        if (bitPerfectRequested) {
+            Log.i(
+                TAG,
+                "BIT-PERFECT REQUEST srcRate=${format.sampleRate} " +
+                    "srcEnc=${format.pcmEncoding} srcCh=${format.channelCount}",
+            )
+            if (tryConfigureBitPerfectDirect(format, specifiedBufferSize, outputChannels)) {
+                bitPerfectAtConfigure = true
+                return
+            }
+            bitPerfectAtConfigure = false
+            Log.w(
+                TAG,
+                "BIT-PERFECT compat path: direct ${format.pcmEncoding}/${format.sampleRate} Hz " +
+                    "unavailable; DSP-bypassed conversion follows (verdict must fail)",
+            )
+        } else {
+            bitPerfectAtConfigure = false
+        }
+
+        if (!nativePathDisabled && processor.isAvailable && canProcess(format) &&
+            tryConfigureNativePath(format, outputChannels)
+        ) {
+            return
+        }
+        configureFallback(format, specifiedBufferSize, outputChannels)
+    }
+
+    /**
+     * Dedicated Bit-Perfect clean path for every PCM depth: the decoder's
+     * buffer reaches AudioTrack with no Float conversion, no SRC and no DSP.
+     * Returns false when the device cannot open the source format directly —
+     * the caller then falls through to the DSP-bypassed compatibility path,
+     * which the signal-path verdict must NOT report as bit-perfect.
+     */
+    private fun tryConfigureBitPerfectDirect(
+        format: Format,
+        specifiedBufferSize: Int,
+        outputChannels: IntArray?,
+    ): Boolean {
+        if (format.sampleMimeType != MimeTypes.AUDIO_RAW ||
+            format.sampleRate <= 0 ||
+            format.channelCount !in 1..2 ||
+            format.pcmEncoding !in SUPPORTED_ENCODINGS
+        ) {
+            return false
+        }
+        return try {
+            if (format.pcmEncoding == C.ENCODING_PCM_FLOAT) {
+                // Float sources need a Float AudioTrack to stay bit-exact;
+                // the PCM16-only fallback would quantize them.
+                if (floatOutputDisabled ||
+                    enhancedDelegate.getFormatSupport(format) == AudioSink.SINK_FORMAT_UNSUPPORTED
+                ) {
+                    return false
+                }
+                safeResetProcessor()
+                // Platform BIT_PERFECT preference must be active BEFORE the
+                // AudioTrack opens — setting it after configure() leaves the
+                // first track on the shared mixer (192k -> 48k hijack).
+                configureUsbOutput(format, format.pcmEncoding, outputChannels)
+                enhancedDelegate.configure(format, specifiedBufferSize, outputChannels)
+                if (activeDelegate !== enhancedDelegate) safeFlush(fallbackDelegate)
+                activeDelegate = enhancedDelegate
+                processingActive = false
+                processedFormat = null
+                lastGainBuffer = null
+                syncDelegateVolume()
+                notifyPlatformEffectsRequired(false)
+                if (playing) enhancedDelegate.play()
+            } else {
+                // 16/24/32-bit integer PCM straight through in its native
+                // packing: the source rate opens the AudioTrack, so no
+                // NLX_ MUSIC resampler runs at any depth.
+                safeResetProcessor()
+                configureUsbOutput(format, format.pcmEncoding, outputChannels)
+                fallbackDelegate.configure(format, specifiedBufferSize, outputChannels)
+                if (activeDelegate !== fallbackDelegate) safeFlush(enhancedDelegate)
+                activeDelegate = fallbackDelegate
+                processingActive = false
+                processedFormat = null
+                lastGainBuffer = null
+                syncDelegateVolume()
+                notifyPlatformEffectsRequired(false)
+                if (playing) fallbackDelegate.play()
+            }
+            Log.i(
+                TAG,
+                "BIT-PERFECT OUTPUT ACTUAL rate=${format.sampleRate} enc=${format.pcmEncoding} " +
+                    "ch=${format.channelCount} DSP=false SRC=false softwareGain=false active=true",
+            )
+            true
+        } catch (error: Exception) {
+            Log.w(TAG, "Bit-Perfect direct configure failed", error)
+            false
+        } catch (error: LinkageError) {
+            Log.w(TAG, "Bit-Perfect direct configure linkage failed", error)
+            false
+        }
+    }
+
+    private fun tryConfigureNativePath(format: Format, outputChannels: IntArray?): Boolean {
+        val outputFormat = try {
+            processor.reset()
+            processor.setTrimFrameCount(format.encoderDelay, format.encoderPadding)
+            processor.configure(AudioProcessor.AudioFormat(format))
+        } catch (error: Exception) {
+            disableNativePath("Native DSP configuration failed", error)
+            return false
+        } catch (error: LinkageError) {
+            disableNativePath("Native DSP configuration linkage failed", error)
+            return false
+        }
+
+        if (outputFormat == AudioProcessor.AudioFormat.NOT_SET ||
+            outputFormat.sampleRate <= 0 ||
+            outputFormat.channelCount !in 1..2 ||
+            outputFormat.encoding != C.ENCODING_PCM_FLOAT
+        ) {
+            disableNativePath("Native DSP rejected decoded PCM", null)
+            return false
+        }
+
+        val floatFormat = asFloatFormat(format, outputFormat)
+        processedFormat = floatFormat
+        outputChannelCount = outputFormat.channelCount
+        try {
+            processor.flush()
+        } catch (error: Exception) {
+            disableNativePath("Native DSP activation failed", error)
+            return false
+        } catch (error: LinkageError) {
+            disableNativePath("Native DSP activation linkage failed", error)
+            return false
+        }
+
+        if (!floatOutputDisabled &&
+            enhancedDelegate.getFormatSupport(floatFormat) != AudioSink.SINK_FORMAT_UNSUPPORTED
+        ) {
+            try {
+                enhancedDelegate.configure(floatFormat, 0, outputChannels)
+                if (activeDelegate !== enhancedDelegate) safeFlush(fallbackDelegate)
+                activeDelegate = enhancedDelegate
+                processingActive = true
+                configureUsbOutput(floatFormat, C.ENCODING_PCM_FLOAT, outputChannels)
+                lastGainBuffer = null
+                syncDelegateVolume()
+                notifyPlatformEffectsRequired(false)
+                if (playing) enhancedDelegate.play()
+                return true
+            } catch (error: Exception) {
+                disableFloatOutput("Float32 AudioTrack configuration failed", error)
+            } catch (error: LinkageError) {
+                disableFloatOutput("Float32 AudioTrack configuration linkage failed", error)
+            }
+        }
+
+        return try {
+            // Float output is deliberately fed into a float-disabled sink.
+            // Media3's ToInt16PcmAudioProcessor performs the final conversion,
+            // while all native DSP remains 32-bit floating point.
+            fallbackDelegate.configure(floatFormat, 0, outputChannels)
+            if (activeDelegate !== fallbackDelegate) safeFlush(enhancedDelegate)
+            activeDelegate = fallbackDelegate
+            processingActive = true
+            configureUsbOutput(floatFormat, C.ENCODING_PCM_16BIT, outputChannels)
+            lastGainBuffer = null
+            syncDelegateVolume()
+            notifyPlatformEffectsRequired(false)
+            if (playing) fallbackDelegate.play()
+            Log.i(TAG, "Using native Float32 DSP with PCM16 AudioTrack compatibility output")
+            true
+        } catch (error: Exception) {
+            disableNativePath("Processed PCM16 compatibility configuration failed", error)
+            false
+        } catch (error: LinkageError) {
+            disableNativePath("Processed PCM16 compatibility linkage failed", error)
+            false
+        }
+    }
+
+    private fun configureFallback(
+        format: Format,
+        specifiedBufferSize: Int,
+        outputChannels: IntArray?,
+    ) {
+        processingActive = false
+        clearPending()
+        clearEndOfStream()
+        processedFormat = null
+        safeResetProcessor()
+        fallbackDelegate.configure(format, specifiedBufferSize, outputChannels)
+        if (activeDelegate !== fallbackDelegate) safeFlush(enhancedDelegate)
+        activeDelegate = fallbackDelegate
+        // Request the mixer format actually sent to AudioTrack (the source
+        // encoding here), not a hardcoded PCM16 that can never match a
+        // 24-bit direct stream on read-back.
+        configureUsbOutput(format, format.pcmEncoding, outputChannels)
+        lastGainBuffer = null
+        syncDelegateVolume()
+        notifyPlatformEffectsRequired(true)
+        if (playing) fallbackDelegate.play()
+    }
+
+    override fun play() {
+        playing = true
+        if (usbExclusive) {
+            exclusiveUsb?.setPaused(false)
+            return
+        }
+        if (internalActive) {
+            internalDirect?.play()
+            return
+        }
+        if (!processingActive) {
+            activeDelegate.play()
+            return
+        }
+        try {
+            activeDelegate.play()
+        } catch (error: Exception) {
+            if (!recoverProcessingPath("Processed output play failed", error)) throw error
+            activeDelegate.play()
+        } catch (error: LinkageError) {
+            if (!recoverProcessingPath("Processed output play linkage failed", error)) throw error
+            activeDelegate.play()
+        }
+    }
+
+    override fun handleDiscontinuity() {
+        clearPending()
+        clearEndOfStream()
+        if (usbExclusive) {
+            exclusiveUsb?.handleDiscontinuity()
+            return
+        }
+        if (internalActive) {
+            // Segment boundary, not a seek: the exclusive clock keeps running.
+            return
+        }
+        if (!processingActive) {
+            activeDelegate.handleDiscontinuity()
+            return
+        }
+        try {
+            processor.flush()
+            activeDelegate.handleDiscontinuity()
+        } catch (error: Exception) {
+            if (!recoverProcessingPath("Processed discontinuity handling failed", error)) throw error
+            activeDelegate.handleDiscontinuity()
+        } catch (error: LinkageError) {
+            if (!recoverProcessingPath("Processed discontinuity linkage failed", error)) throw error
+            activeDelegate.handleDiscontinuity()
+        }
+    }
+
+    override fun handleBuffer(
+        buffer: ByteBuffer,
+        presentationTimeUs: Long,
+        encodedAccessUnitCount: Int,
+    ): Boolean {
+        maybeAdoptExclusiveUsb()
+        maybeAdoptInternalDirect()
+        if (directEqBuffer !== buffer && isDirectEqRoute()) {
+            directEq.process(buffer)
+            directEqBuffer = buffer
+        }
+        val consumed = handleRoutedBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
+        // Decoder buffers are recycled objects: once consumed, the next
+        // payload in the same object must be equalised again.
+        if (consumed) directEqBuffer = null
+        return consumed
+    }
+
+    /** True when this buffer bypasses the native DSP (where the EQ otherwise runs). */
+    private fun isDirectEqRoute(): Boolean = when {
+        usbExclusive -> !isExclusiveConverting()
+        internalActive -> internalDirect?.requiresResampling() != true
+        else -> !processingActive
+    }
+
+    private fun handleRoutedBuffer(
+        buffer: ByteBuffer,
+        presentationTimeUs: Long,
+        encodedAccessUnitCount: Int,
+    ): Boolean {
+        if (usbExclusive) {
+            if (exclusiveUsb?.isPaused() == true) {
+                return false
+            }
+            if (isExclusiveConverting()) {
+                return handleExclusiveConvertedBuffer(buffer, presentationTimeUs)
+            }
+            val fmt = configuredFormat
+            lastGainBuffer = null
+            val ok = exclusiveUsb?.write(
+                buffer,
+                presentationTimeUs,
+                isFloatBuffer = fmt?.pcmEncoding == C.ENCODING_PCM_FLOAT,
+            ) == true
+            if (ok) {
+                exclusiveEnded = false
+                return true
+            }
+            // Queue full: the DAC is still running. Return false so ExoPlayer
+            // retries and keeps loading the network. Tearing the session down
+            // here is what left the bar moving with the pause control spinning.
+            if (exclusiveUsb?.isStreamAlive() == true) {
+                return false
+            }
+            // A seek discards in-flight URBs. The first write after that can
+            // fail once; tearing the USB session down here is what left the
+            // DAC silent while the seek bar kept moving.
+            if (exclusiveUsb?.restartIfStopped() == true) {
+                return false
+            }
+            exclusiveStartFailed = true
+            leaveExclusiveUsb(configureAndroid = true)
+        }
+        if (internalActive) {
+            if (handleInternalDirectBuffer(buffer, presentationTimeUs)) return true
+            // Ring full: the endpoint is still playing, Media3 retries later.
+            if (internalActive) return false
+            // The stream died (route change): the rest of this buffer goes
+            // to the Android path that leaveInternalDirect() just configured.
+        }
+        if (!processingActive) {
+            return handleDirectPassthrough(buffer, presentationTimeUs, encodedAccessUnitCount)
+        }
+        try {
+            return handleProcessedBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
+        } catch (error: Exception) {
+            if (!recoverProcessingPath("Native/processed buffer failed", error)) throw error
+        } catch (error: LinkageError) {
+            if (!recoverProcessingPath("Native/processed buffer linkage failed", error)) throw error
+        }
+        if (!processingActive) {
+            return fallbackDelegate.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
+        }
+        return try {
+            handleProcessedBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
+        } catch (retryError: Exception) {
+            if (!switchToPlatformFallback("Processed PCM16 retry failed", retryError)) throw retryError
+            fallbackDelegate.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
+        } catch (retryError: LinkageError) {
+            if (!switchToPlatformFallback("Processed PCM16 retry linkage failed", retryError)) throw retryError
+            fallbackDelegate.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
+        }
+    }
+
+    /**
+     * Bit-perfect direct path with workable volume. At unity gain the buffer
+     * passes untouched (bit-exact). Below unity — app volume, ducking, fades —
+     * samples are scaled in software first, because a granted BIT_PERFECT
+     * mixer bypass ignores AudioTrack volume: without this the volume keys
+     * would go dead the moment raw output engages. Any scaling is observed
+     * via [currentVolume], so the signal-path verdict honestly fails while
+     * attenuated and passes again at unity.
+     */
+    private fun handleDirectPassthrough(
+        buffer: ByteBuffer,
+        presentationTimeUs: Long,
+        encodedAccessUnitCount: Int,
+    ): Boolean {
+        val gain = lastVolume
+        val needsGain = bitPerfectRequested && bitPerfectAtConfigure && hasConfigured &&
+            gain < 1f - 1e-6f && gain >= 0f && buffer.hasRemaining()
+        if (!needsGain) {
+            lastGainBuffer = null
+            return activeDelegate.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
+        }
+        // Media3 retries the SAME buffer object when the delegate partially
+        // consumes it. Scale once per buffer identity: re-scaling the tail on
+        // retry would compound attenuation.
+        if (lastGainBuffer !== buffer) {
+            val fmt = configuredFormat
+            if (fmt == null || fmt.sampleMimeType != MimeTypes.AUDIO_RAW) {
+                return activeDelegate.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
+            }
+            scalePcmInPlace(buffer, buffer.position(), buffer.limit(), fmt.pcmEncoding, gain)
+            lastGainBuffer = buffer
+        }
+        return activeDelegate.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
+    }
+
+    private fun scalePcmInPlace(
+        buffer: ByteBuffer,
+        startPos: Int,
+        endPos: Int,
+        media3Encoding: Int,
+        gain: Float,
+    ) {
+        if (buffer.isReadOnly) return
+        val originalOrder = buffer.order()
+        try {
+            buffer.order(ByteOrder.LITTLE_ENDIAN)
+            if (gain <= 0f) {
+                var pos = startPos
+                while (pos < endPos) {
+                    buffer.put(pos, 0.toByte())
+                    pos++
+                }
+                return
+            }
+
+            when (media3Encoding) {
+                C.ENCODING_PCM_16BIT -> {
+                    var pos = startPos
+                    while (pos + 1 < endPos) {
+                        val sample = buffer.getShort(pos).toInt()
+                        val scaled = (sample * gain + if (sample >= 0) 0.5f else -0.5f).toInt()
+                            .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                        buffer.putShort(pos, scaled.toShort())
+                        pos += 2
+                    }
+                }
+                C.ENCODING_PCM_24BIT -> {
+                    var pos = startPos
+                    while (pos + 2 < endPos) {
+                        val b1 = buffer.get(pos).toInt() and 0xFF
+                        val b2 = buffer.get(pos + 1).toInt() and 0xFF
+                        val b3 = buffer.get(pos + 2).toInt()
+                        val sample = (b1 or (b2 shl 8) or (b3 shl 16))
+                        val scaled = (sample * gain.toDouble()).toLong()
+                            .coerceIn(-8388608L, 8388607L).toInt()
+                        buffer.put(pos, scaled.toByte())
+                        buffer.put(pos + 1, (scaled shr 8).toByte())
+                        buffer.put(pos + 2, (scaled shr 16).toByte())
+                        pos += 3
+                    }
+                }
+                C.ENCODING_PCM_32BIT -> {
+                    var pos = startPos
+                    while (pos + 3 < endPos) {
+                        val sample = buffer.getInt(pos)
+                        val scaled = (sample * gain.toDouble()).toLong()
+                            .coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong())
+                        buffer.putInt(pos, scaled.toInt())
+                        pos += 4
+                    }
+                }
+                C.ENCODING_PCM_FLOAT -> {
+                    var pos = startPos
+                    while (pos + 3 < endPos) {
+                        buffer.putFloat(pos, (buffer.getFloat(pos) * gain).coerceIn(-1f, 1f))
+                        pos += 4
+                    }
+                }
+                else -> Unit
+            }
+        } finally {
+            buffer.order(originalOrder)
+        }
+    }
+
+    private fun handleProcessedBuffer(
+        buffer: ByteBuffer,
+        presentationTimeUs: Long,
+        encodedAccessUnitCount: Int,
+    ): Boolean {
+        if (pendingOutput == null) {
+            if (!buffer.hasRemaining()) return true
+            processor.queueInput(buffer.duplicate())
+            pendingInputLimit = buffer.limit()
+            val output = processor.getOutput()
+            pendingOutput = output
+            pendingPresentationTimeUs = presentationTimeUs
+            pendingAccessUnitCount = encodedAccessUnitCount
+            pendingOutputFrameCount = output.remaining() /
+                (Float.SIZE_BYTES * outputChannelCount)
+        }
+
+        val output = pendingOutput ?: return true
+        if (output.hasRemaining()) {
+            activeDelegate.handleBuffer(output, pendingPresentationTimeUs, pendingAccessUnitCount)
+        }
+        if (output.hasRemaining()) return false
+
+        nextOutputPresentationTimeUs = pendingPresentationTimeUs +
+            pendingOutputFrameCount * MICROS_PER_SECOND / processor.nativeOutputSampleRate
+        if (buffer.position() < pendingInputLimit) {
+            buffer.position(pendingInputLimit)
+        }
+        clearPending()
+        return true
+    }
+
+    override fun playToEndOfStream() {
+        if (usbExclusive) {
+            if (exclusiveConvertSourceHz > 0) drainExclusiveConverterTail()
+            exclusiveEnded = true
+            return
+        }
+        if (internalActive) {
+            if (exclusiveConvertSourceHz > 0) drainInternalConverterTail()
+            internalEnded = true
+            return
+        }
+        if (!processingActive) {
+            activeDelegate.playToEndOfStream()
+            return
+        }
+        try {
+            if (!endOfStreamQueued) {
+                processor.queueEndOfStream()
+                endOfStreamOutput = processor.getOutput()
+                endOfStreamQueued = true
+            }
+            val tail = endOfStreamOutput
+            if (tail?.hasRemaining() == true) {
+                activeDelegate.handleBuffer(tail, nextOutputPresentationTimeUs, 1)
+                if (tail.hasRemaining()) return
+            }
+            activeDelegate.playToEndOfStream()
+        } catch (error: Exception) {
+            if (!recoverProcessingPath("Processed end-of-stream failed", error)) throw error
+            activeDelegate.playToEndOfStream()
+        } catch (error: LinkageError) {
+            if (!recoverProcessingPath("Processed end-of-stream linkage failed", error)) throw error
+            activeDelegate.playToEndOfStream()
+        }
+    }
+
+    override fun isEnded(): Boolean =
+        if (usbExclusive) {
+            exclusiveEnded
+        } else if (internalActive) {
+            internalEnded && pendingInternalFloat?.hasRemaining() != true &&
+                internalDirect?.hasPendingData() != true
+        } else {
+            activeDelegate.isEnded() &&
+                pendingOutput?.hasRemaining() != true &&
+                endOfStreamOutput?.hasRemaining() != true
+        }
+
+    override fun hasPendingData(): Boolean =
+        if (usbExclusive) {
+            !exclusiveEnded && (exclusiveUsb?.hasPendingData() == true ||
+                pendingUsbFloat?.hasRemaining() == true)
+        } else if (internalActive) {
+            pendingInternalFloat?.hasRemaining() == true || internalDirect?.hasPendingData() == true
+        } else {
+            pendingOutput?.hasRemaining() == true ||
+                endOfStreamOutput?.hasRemaining() == true ||
+                activeDelegate.hasPendingData()
+        }
+
+    override fun setPlaybackParameters(playbackParameters: PlaybackParameters) {
+        enhancedDelegate.setPlaybackParameters(playbackParameters)
+        fallbackDelegate.setPlaybackParameters(playbackParameters)
+    }
+
+    override fun getPlaybackParameters(): PlaybackParameters =
+        activeDelegate.getPlaybackParameters()
+
+    override fun setSkipSilenceEnabled(skipSilenceEnabled: Boolean) {
+        // Silence-skipping deletes samples — invisible to the signal-path
+        // verdict, so it must be enforced here rather than merely observed.
+        val effective = if (bitPerfectRequested && skipSilenceEnabled) {
+            Log.w(TAG, "BIT-PERFECT: skip-silence ignored (would remove samples)")
+            false
+        } else {
+            skipSilenceEnabled
+        }
+        enhancedDelegate.setSkipSilenceEnabled(effective)
+        fallbackDelegate.setSkipSilenceEnabled(effective)
+    }
+
+    override fun getSkipSilenceEnabled(): Boolean =
+        activeDelegate.getSkipSilenceEnabled()
+
+    override fun setAudioAttributes(audioAttributes: AudioAttributes) {
+        usbOutput?.setAttributes(audioAttributes.audioAttributesV21.audioAttributes)
+        enhancedDelegate.setAudioAttributes(audioAttributes)
+        fallbackDelegate.setAudioAttributes(audioAttributes)
+    }
+
+    override fun getAudioAttributes(): AudioAttributes? =
+        activeDelegate.getAudioAttributes()
+
+    override fun setAudioSessionId(audioSessionId: Int) {
+        enhancedDelegate.setAudioSessionId(audioSessionId)
+        fallbackDelegate.setAudioSessionId(audioSessionId)
+    }
+
+    override fun setAuxEffectInfo(auxEffectInfo: AuxEffectInfo) {
+        // Aux sends (reverb etc.) recolor PCM and are invisible to the
+        // verdict — never attach them while Bit-Perfect is requested. The app
+        // never sets an aux effect, so dropping the call keeps the chain none.
+        if (bitPerfectRequested) return
+        enhancedDelegate.setAuxEffectInfo(auxEffectInfo)
+        fallbackDelegate.setAuxEffectInfo(auxEffectInfo)
+    }
+
+    override fun setPreferredDevice(audioDeviceInfo: AudioDeviceInfo?) {
+        usbOutput?.setDevice(audioDeviceInfo)
+        enhancedDelegate.setPreferredDevice(audioDeviceInfo)
+        fallbackDelegate.setPreferredDevice(audioDeviceInfo)
+    }
+
+    /**
+     * USB-DAC mode: request the track's native rate so the sink opens its
+     * AudioTrack without app-side resampling. Null restores default
+     * behavior. Takes effect when the sink next configures (next track).
+     */
+    fun setOutputSampleRateOverride(sampleRateHz: Int?) {
+        requestedOutputOverrideHz = sampleRateHz
+        runCatching { processor.setOutputSampleRateOverride(sampleRateHz) }
+    }
+
+    /**
+     * Same-family fallback target the exclusive stream should open at when
+     * the DAC lacks the source rate (null = native). Takes effect on the
+     * next exclusive configure; cleared automatically when routing pushes
+     * null (DAC removed, exclusive off, or rate natively supported).
+     */
+    fun setExclusiveFallbackRateHz(sampleRateHz: Int?, forSourceHz: Int? = null) {
+        exclusiveFallbackRateHz = sampleRateHz?.takeIf { it > 0 }
+        exclusiveFallbackSourceRateHz = forSourceHz?.takeIf { it > 0 }
+    }
+
+    /** Actual rate the sink configured, 0 when unresolved. */
+    fun currentOutputSampleRateHz(): Int =
+        if (usbExclusive) {
+            exclusiveUsb?.currentRateHz() ?: 0
+        } else if (internalActive) {
+            internalDirect?.deviceRateHz() ?: 0
+        } else if (processingActive) {
+            processedFormat?.sampleRate ?: 0
+        } else {
+            configuredFormat?.sampleRate ?: 0
+        }
+
+    fun syncExclusiveUsb(wanted: Boolean) {
+        val wasWanted = exclusiveWanted
+        exclusiveWanted = wanted
+        if (wanted && !wasWanted) {
+            exclusiveStartFailed = false
+        } else if (!wanted && usbExclusive) {
+            leaveExclusiveUsb(configureAndroid = hasConfigured && configuredFormat != null)
+        }
+    }
+
+    fun notifyExclusiveUsbMayStart() {
+        exclusiveWanted = true
+        exclusiveStartFailed = false
+    }
+
+    fun setBitPerfectRequested(enabled: Boolean) {
+        if (bitPerfectRequested == enabled) return
+        bitPerfectRequested = enabled
+        usbOutput?.setEnabled(enabled)
+        if (enabled) {
+            // Push the verdict-invisible modifiers to their neutral state
+            // immediately: a mid-track toggle must not leave a previously
+            // enabled skip/aux attached until the next configure. (Aux sends
+            // are additionally dropped in setAuxEffectInfo while requested.)
+            setSkipSilenceEnabled(false)
+        }
+        Log.i(TAG, "BIT-PERFECT requested=$enabled (takes effect on next configure)")
+    }
+
+    fun isPlatformBitPerfectConfigured(): Boolean = usbOutput?.isConfigured() == true
+
+    /**
+     * True only when the ACTIVE AudioTrack configuration is the untouched
+     * direct path — requested AND configured direct AND still direct (no
+     * runtime recovery rerouted through conversion since).
+     */
+    fun isBitPerfectBypassActive(): Boolean =
+        usbExclusive || internalActive ||
+            (bitPerfectRequested && hasConfigured && bitPerfectAtConfigure && !processingActive)
+
+    fun isExclusiveUsbActive(): Boolean = usbExclusive
+
+    fun isInternalDirectActive(): Boolean = internalActive
+
+    /**
+     * The audio route changed (Bluetooth, jack…): a previous refusal or a lost
+     * stream may not apply to the new output, so allow one fresh attempt at
+     * the next buffer boundary.
+     */
+    fun retryInternalDirect() {
+        internalStartFailed = false
+    }
+
+    /** MusicPlayer pushes "toggle on + route eligible + Bit-Perfect on" here. */
+    fun syncInternalDirect(wanted: Boolean) {
+        val wasWanted = internalWanted
+        internalWanted = wanted
+        if (wanted && !wasWanted) {
+            internalStartFailed = false
+        } else if (!wanted && internalActive) {
+            leaveInternalDirect(configureAndroid = hasConfigured && configuredFormat != null)
+        }
+    }
+
+    private fun tryConfigureInternalDirect(format: Format): Boolean {
+        val output = internalDirect ?: return false
+        if (!internalWanted || internalStartFailed || usbExclusive) return false
+        if (format.sampleMimeType != MimeTypes.AUDIO_RAW ||
+            format.sampleRate <= 0 ||
+            format.channelCount !in 1..2 ||
+            format.pcmEncoding !in SUPPORTED_ENCODINGS
+        ) {
+            return false
+        }
+        // Tempo/pitch lives in Media3's Sonic stage inside DefaultAudioSink,
+        // which this path skips: never engage unless playback is at 1x.
+        if (runCatching { activeDelegate.getPlaybackParameters() }.getOrNull()
+                ?.let { it.speed != 1f || it.pitch != 1f } == true
+        ) {
+            return false
+        }
+        val opened = runCatching { output.configure(format, bitDepthHintProvider?.invoke()) }.getOrDefault(false)
+        if (!opened) {
+            internalStartFailed = true
+            runCatching { output.reset() }
+            return false
+        }
+        // The regular AudioTrack must not keep playing next to the endpoint.
+        runCatching { enhancedDelegate.pause() }
+        runCatching { fallbackDelegate.pause() }
+        runCatching { enhancedDelegate.flush() }
+        runCatching { fallbackDelegate.flush() }
+        clearExclusiveConverter()
+        if (output.requiresResampling()) {
+            val target = output.deviceRateHz()
+            if (target <= 0 || !setupExclusiveConverter(format, target)) {
+                Log.w(TAG, "Internal direct: resampler unavailable; staying on the mixer path")
+                runCatching { output.reset() }
+                internalStartFailed = true
+                if (playing) runCatching { activeDelegate.play() }
+                return false
+            }
+        }
+        internalActive = true
+        internalEnded = false
+        pendingInternalFloat = null
+        processingActive = false
+        processedFormat = null
+        lastGainBuffer = null
+        usbOutput?.setFormat(null)
+        activeDelegate = fallbackDelegate
+        syncDelegateVolume()
+        notifyPlatformEffectsRequired(false)
+        if (playing) output.play()
+        Log.i(
+            TAG,
+            "INTERNAL DIRECT OUTPUT src=${format.sampleRate}Hz enc=${format.pcmEncoding} " +
+                "ch=${format.channelCount} device=${output.deviceRateHz()}Hz " +
+                "resampled=${output.requiresResampling()} AudioTrack=idle",
+        )
+        return true
+    }
+
+    /**
+     * Mid-track engage (toggle switched on, or back from Bluetooth to the
+     * speaker/jack). Only at a clean buffer boundary: never while processed
+     * output or an end-of-stream tail is still pending on the Android path.
+     * What the AudioTrack had queued is dropped — a short skip, once.
+     */
+    private fun maybeAdoptInternalDirect() {
+        if (!internalWanted || internalActive || internalStartFailed || usbExclusive || !hasConfigured) return
+        if (pendingOutput != null || endOfStreamQueued) return
+        val format = configuredFormat ?: return
+        if (tryConfigureInternalDirect(format)) {
+            bitPerfectAtConfigure = bitPerfectRequested
+        }
+    }
+
+    /** Back to the Android mixer path (toggle off, route change, dead stream). */
+    private fun leaveInternalDirect(configureAndroid: Boolean) {
+        internalActive = false
+        internalEnded = false
+        pendingInternalFloat = null
+        clearExclusiveConverter()
+        runCatching { internalDirect?.reset() }
+        if (!configureAndroid) return
+        val format = configuredFormat ?: return
+        if (bitPerfectRequested &&
+            tryConfigureBitPerfectDirect(format, configuredBufferSize, configuredOutputChannels)
+        ) {
+            bitPerfectAtConfigure = true
+            return
+        }
+        if (!nativePathDisabled && processor.isAvailable && canProcess(format) &&
+            tryConfigureNativePath(format, configuredOutputChannels)
+        ) {
+            bitPerfectAtConfigure = false
+            return
+        }
+        configureFallback(format, configuredBufferSize, configuredOutputChannels)
+        bitPerfectAtConfigure = false
+    }
+
+    private fun handleInternalDirectBuffer(buffer: ByteBuffer, presentationTimeUs: Long): Boolean {
+        val output = internalDirect
+        if (output == null || !output.isAlive()) {
+            Log.w(TAG, "Internal direct stream lost (route change?); back to the mixer path")
+            internalStartFailed = true
+            leaveInternalDirect(configureAndroid = true)
+            return false
+        }
+        val fmt = configuredFormat ?: return false
+        if (output.requiresResampling()) {
+            return handleInternalConvertedBuffer(buffer, presentationTimeUs, output, fmt)
+        }
+        // App-side gain only (fades, focus ducking): the system volume is
+        // still applied by Android on this route.
+        val gain = lastVolume
+        if (gain < 1f - 1e-6f && gain >= 0f && buffer.hasRemaining()) {
+            if (lastGainBuffer !== buffer) {
+                scalePcmInPlace(buffer, buffer.position(), buffer.limit(), fmt.pcmEncoding, gain)
+                lastGainBuffer = buffer
+            }
+        }
+        val done = output.write(buffer, presentationTimeUs, fmt.pcmEncoding, fmt.channelCount)
+        if (done) {
+            internalEnded = false
+            // Decoder buffers are recycled objects: identity must not
+            // suppress scaling of the next, different payload.
+            lastGainBuffer = null
+        }
+        return done
+    }
+
+    private fun handleInternalConvertedBuffer(
+        buffer: ByteBuffer,
+        presentationTimeUs: Long,
+        output: InternalDirectOutput,
+        source: Format,
+    ): Boolean {
+        pendingInternalFloat?.let { pending ->
+            if (pending.hasRemaining()) {
+                if (!output.write(pending, pendingInternalPtsUs, C.ENCODING_PCM_FLOAT, converterChannels)) return false
+            }
+            pendingInternalFloat = null
+        }
+        if (!buffer.hasRemaining()) return true
+        val target = output.deviceRateHz().takeIf { it > 0 } ?: return false
+        if (exclusiveConvertSourceHz != source.sampleRate || processor.nativeOutputSampleRate != target) {
+            if (!setupExclusiveConverter(source, target)) return false
+        }
+        val gain = lastVolume
+        processor.queueInput(buffer.duplicate())
+        buffer.position(buffer.limit())
+        var guard = 0
+        while (guard++ < 32) {
+            val out = processor.getOutput()
+            if (out === AudioProcessor.EMPTY_BUFFER || !out.hasRemaining()) break
+            if (gain < 1f - 1e-6f && gain >= 0f) {
+                scalePcmInPlace(out, out.position(), out.limit(), C.ENCODING_PCM_FLOAT, gain)
+            }
+            if (!output.write(out, presentationTimeUs, C.ENCODING_PCM_FLOAT, converterChannels)) {
+                pendingInternalFloat = out
+                pendingInternalPtsUs = presentationTimeUs
+                return false
+            }
+        }
+        internalEnded = false
+        return true
+    }
+
+    private fun drainInternalConverterTail() {
+        val output = internalDirect ?: return
+        pendingInternalFloat?.let { pending ->
+            if (pending.hasRemaining()) {
+                runCatching { output.write(pending, pendingInternalPtsUs, C.ENCODING_PCM_FLOAT, converterChannels) }
+            }
+            pendingInternalFloat = null
+        }
+        runCatching {
+            processor.queueEndOfStream()
+            var guard = 0
+            while (guard++ < 16) {
+                val out = processor.getOutput()
+                if (out === AudioProcessor.EMPTY_BUFFER || !out.hasRemaining()) break
+                if (!output.write(out, pendingInternalPtsUs, C.ENCODING_PCM_FLOAT, converterChannels)) break
+            }
+        }
+    }
+
+    /**
+     * True when the toggle changed after the active configuration was built
+     * (mid-track toggle): the verdict must fail until the next track
+     * reconfigures, instead of claiming bypass for pre-toggle audio.
+     */
+    fun isBitPerfectConfigStale(): Boolean =
+        !usbExclusive && hasConfigured && (bitPerfectRequested != bitPerfectAtConfigure)
+
+    private fun tryConfigureExclusiveUsb(format: Format): Boolean {
+        if (!exclusiveWanted || exclusiveStartFailed) return false
+        val session = exclusiveUsb ?: return false
+        if (format.sampleMimeType != MimeTypes.AUDIO_RAW ||
+            format.sampleRate <= 0 ||
+            format.channelCount !in 1..2 ||
+            format.pcmEncoding !in SUPPORTED_ENCODINGS
+        ) {
+            return false
+        }
+        // Release AudioTrack before claiming the USB interface. While the
+        // mixer still owns the DAC, libusb cannot detach snd-usb-audio and
+        // exclusive start fails closed onto the shared 48 kHz track.
+        runCatching { enhancedDelegate.pause() }
+        runCatching { fallbackDelegate.pause() }
+        runCatching { enhancedDelegate.flush() }
+        runCatching { fallbackDelegate.flush() }
+        // Fallback target: when the DAC descriptor lacks the source rate,
+        // open the stream at the supported rate (e.g. 88.2 -> 44.1, 44.1 -> 48 kHz)
+        // and convert through native soxr so the DAC receives a supported clock rate.
+        val fallbackTarget = exclusiveFallbackRateHz
+            ?.takeIf { it > 0 && it != format.sampleRate && (exclusiveFallbackSourceRateHz == null || exclusiveFallbackSourceRateHz == format.sampleRate) }
+        val started = runCatching {
+            session.configure(format, fallbackTarget, bitDepthHintProvider?.invoke())
+        }.getOrDefault(false)
+        if (!started) {
+            exclusiveStartFailed = true
+            usbExclusive = false
+            clearExclusiveConverter()
+            if (playing) {
+                runCatching { activeDelegate.play() }
+            }
+            return false
+        }
+        val negotiatedRate = session.currentRateHz().takeIf { it > 0 && it != format.sampleRate }
+            ?: fallbackTarget
+        if (negotiatedRate != null) {
+            exclusiveFallbackRateHz = negotiatedRate
+            exclusiveFallbackSourceRateHz = format.sampleRate
+            // Fail closed like a failed exclusive start below: an open
+            // 44.1 kHz stream fed raw 88.2 kHz bytes is garbage, so tear the
+            // half-opened session down and let the flow continue onto the
+            // mixer path. Never stall here — the render watchdog would sit
+            // on silence.
+            if (!setupExclusiveConverter(format, negotiatedRate)) {
+                Log.w(TAG, "Exclusive rate fallback conversion unavailable; leaving exclusive USB")
+                runCatching { exclusiveUsb?.reset() }
+                exclusiveStartFailed = true
+                usbExclusive = false
+                clearExclusiveConverter()
+                if (playing) {
+                    runCatching { activeDelegate.play() }
+                }
+                return false
+            }
+            Log.i(
+                TAG,
+                "EXCLUSIVE USB RATE FALLBACK ${format.sampleRate} -> $negotiatedRate Hz " +
+                    "(DAC lacks source rate; native soxr conversion, no gold)",
+            )
+        } else {
+            clearExclusiveConverter()
+        }
+        enterExclusiveUsb()
+        processingActive = false
+        processedFormat = null
+        lastGainBuffer = null
+        usbOutput?.setFormat(null)
+        activeDelegate = fallbackDelegate
+        syncDelegateVolume()
+        notifyPlatformEffectsRequired(false)
+        Log.i(
+            TAG,
+            "EXCLUSIVE USB OUTPUT rate=${format.sampleRate} enc=${format.pcmEncoding} " +
+                "ch=${format.channelCount} AudioTrack=idle",
+        )
+        return true
+    }
+
+    private fun maybeAdoptExclusiveUsb() {
+        if (!exclusiveWanted || usbExclusive || exclusiveStartFailed || !hasConfigured) return
+        // Never mid-track over a running internal direct output: the next
+        // item's configure() tries USB exclusive first anyway.
+        if (internalActive) return
+        val format = configuredFormat ?: return
+        if (tryConfigureExclusiveUsb(format)) {
+            bitPerfectAtConfigure = true
+        }
+    }
+
+    private fun enterExclusiveUsb() {
+        usbExclusive = true
+        exclusiveWanted = true
+        exclusiveStartFailed = false
+        exclusiveEnded = false
+    }
+
+    private fun leaveExclusiveUsb(configureAndroid: Boolean) {
+        usbExclusive = false
+        exclusiveEnded = false
+        clearExclusiveConverter()
+        runCatching { exclusiveUsb?.reset() }
+        if (!configureAndroid) return
+        val format = configuredFormat ?: return
+        if (bitPerfectRequested &&
+            tryConfigureBitPerfectDirect(format, configuredBufferSize, configuredOutputChannels)
+        ) {
+            bitPerfectAtConfigure = true
+            return
+        }
+        configureFallback(format, configuredBufferSize, configuredOutputChannels)
+        bitPerfectAtConfigure = false
+    }
+
+    /**
+     * Builds the native soxr conversion for exclusive rate fallback
+     * (source -> target, e.g. 88.2 -> 44.1 kHz). Borrows the shared
+     * processor the same way the AudioTrack native path does, then restores
+     * that path's output override — the instance keeps the conversion until
+     * its next reset/configure, and every path entry rebuilds it anyway.
+     */
+    private fun setupExclusiveConverter(source: Format, targetHz: Int): Boolean {
+        clearExclusiveConverter()
+        if (!processor.isAvailable) return false
+        return try {
+            processor.reset()
+            processor.setTrimFrameCount(source.encoderDelay, source.encoderPadding)
+            processor.setOutputSampleRateOverride(targetHz)
+            val out = processor.configure(AudioProcessor.AudioFormat(source))
+            processor.setOutputSampleRateOverride(requestedOutputOverrideHz)
+            if (out == AudioProcessor.AudioFormat.NOT_SET || out.sampleRate != targetHz) {
+                runCatching { processor.reset() }
+                false
+            } else {
+                processor.flush()
+                exclusiveConvertSourceHz = source.sampleRate
+                converterChannels = out.channelCount.coerceIn(1, 2)
+                true
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "Exclusive converter setup failed", error)
+            runCatching { processor.reset() }
+            runCatching { processor.setOutputSampleRateOverride(requestedOutputOverrideHz) }
+            false
+        } catch (error: LinkageError) {
+            Log.w(TAG, "Exclusive converter setup linkage failed", error)
+            runCatching { processor.reset() }
+            runCatching { processor.setOutputSampleRateOverride(requestedOutputOverrideHz) }
+            false
+        }
+    }
+
+    private fun clearExclusiveConverter() {
+        exclusiveFallbackRateHz = null
+        exclusiveFallbackSourceRateHz = null
+        exclusiveConvertSourceHz = 0
+        pendingUsbFloat = null
+    }
+
+    fun isExclusiveConverting(): Boolean {
+        val source = configuredFormat ?: return false
+        if (!usbExclusive) return false
+        val activeUsbRate = exclusiveUsb?.currentRateHz() ?: 0
+        if (activeUsbRate > 0 && activeUsbRate != source.sampleRate) return true
+        val fallback = exclusiveFallbackRateHz ?: 0
+        val fallbackSource = exclusiveFallbackSourceRateHz
+        return fallback > 0 && fallback != source.sampleRate &&
+            (fallbackSource == null || fallbackSource == source.sampleRate)
+    }
+
+    fun exclusiveSourceSampleRateHz(): Int = configuredFormat?.sampleRate ?: 0
+
+    /**
+     * Converted exclusive write: source PCM through native soxr at the
+     * fallback rate, straight into the USB queue (Float32, same path float
+     * decoder output already takes). Mirrors the pending discipline of
+     * [handleProcessedBuffer]: leftovers drain first and new input is only
+     * consumed once its output is fully written or stashed — never
+     * double-fed on retry.
+     */
+    private fun handleExclusiveConvertedBuffer(buffer: ByteBuffer, presentationTimeUs: Long): Boolean {
+        pendingUsbFloat?.let { pending ->
+            if (pending.hasRemaining()) {
+                if (!writeConvertedToUsb(pending, pendingUsbPtsUs)) return false
+                pendingUsbFloat = null
+            }
+        }
+        if (!buffer.hasRemaining()) return true
+        val source = configuredFormat ?: return false
+        val activeUsbRate = exclusiveUsb?.currentRateHz()?.takeIf { it > 0 && it != source.sampleRate }
+        val target = activeUsbRate
+            ?: exclusiveFallbackRateHz?.takeIf { hz ->
+                hz > 0 && hz != source.sampleRate &&
+                    (exclusiveFallbackSourceRateHz == null || exclusiveFallbackSourceRateHz == source.sampleRate)
+            }
+            ?: return false
+        if (exclusiveConvertSourceHz != source.sampleRate || processor.nativeOutputSampleRate != target) {
+            // Seek/flush raced the converter; rebuild cheaply inline.
+            // Failing closed here returns false and the render watchdog
+            // owns the worst case — never feed unconverted bytes.
+            if (!setupExclusiveConverter(source, target)) return false
+        }
+        // The exclusive USB writer owns software gain for both raw and
+        // resampled PCM. Applying it here too attenuates fallback PCM twice.
+        processor.queueInput(buffer.duplicate())
+        buffer.position(buffer.limit())
+        var guard = 0
+        while (guard++ < 32) {
+            val out = processor.getOutput()
+            if (out === AudioProcessor.EMPTY_BUFFER || !out.hasRemaining()) break
+            if (!writeConvertedToUsb(out, presentationTimeUs)) {
+                pendingUsbFloat = out
+                pendingUsbPtsUs = presentationTimeUs
+                return false
+            }
+        }
+        return true
+    }
+
+    private fun writeConvertedToUsb(output: ByteBuffer, presentationTimeUs: Long): Boolean {
+        val session = exclusiveUsb ?: return false
+        return session.write(output, presentationTimeUs, isFloatBuffer = true)
+    }
+
+    /** Best-effort soxr tail at end-of-stream: dropping it would audibly cut
+     *  reverb tails on every fallback track. Never blocks — leftovers drop
+     *  like the raw path already does today. */
+    private fun drainExclusiveConverterTail() {
+        val session = exclusiveUsb ?: return
+        pendingUsbFloat?.let { pending ->
+            if (pending.hasRemaining()) runCatching { session.write(pending, pendingUsbPtsUs, isFloatBuffer = true) }
+            pendingUsbFloat = null
+        }
+        if (exclusiveConvertSourceHz <= 0) return
+        runCatching {
+            processor.queueEndOfStream()
+            var guard = 0
+            while (guard++ < 16) {
+                val out = processor.getOutput()
+                if (out === AudioProcessor.EMPTY_BUFFER || !out.hasRemaining()) break
+                if (!session.write(out, pendingUsbPtsUs, isFloatBuffer = true)) break
+            }
+        }
+    }
+
+    private fun configureUsbOutput(format: Format, media3Encoding: Int, channels: IntArray?) {
+        if (format.sampleMimeType != MimeTypes.AUDIO_RAW || format.sampleRate <= 0) {
+            usbOutput?.setFormat(null)
+            return
+        }
+        val count = channels?.size ?: format.channelCount
+        val mask = when (count) {
+            1 -> AudioFormat.CHANNEL_OUT_MONO
+            2 -> AudioFormat.CHANNEL_OUT_STEREO
+            else -> { usbOutput?.setFormat(null); return }
+        }
+        // Media3 C.ENCODING_* ints are NOT android.media.AudioFormat ints
+        // (e.g. Media3 24-bit != Android 24-bit-packed). Passing them through
+        // raw builds a wrong mixer request (24-bit source asked as 8-bit),
+        // so BIT_PERFECT never matches and the mixer hijacks to 48 kHz.
+        val androidEncoding = androidEncodingFor(media3Encoding)
+        if (androidEncoding == 0) {
+            Log.w(TAG, "BIT-PERFECT mixer request skipped: no Android encoding for Media3 $media3Encoding")
+            usbOutput?.setFormat(null)
+            return
+        }
+        val pcm = runCatching {
+            AudioFormat.Builder().setSampleRate(format.sampleRate)
+                .setEncoding(androidEncoding).setChannelMask(mask).build()
+        }.getOrNull()
+        usbOutput?.setFormat(pcm)
+    }
+
+    /**
+     * Maps Media3 PCM encoding to the platform AudioFormat encoding used by
+     * AudioTrack and AudioMixerAttributes. Returns 0 when the device cannot
+     * represent the source depth directly (caller fails closed).
+     */
+    private fun androidEncodingFor(media3Encoding: Int): Int = when (media3Encoding) {
+        C.ENCODING_PCM_16BIT -> AudioFormat.ENCODING_PCM_16BIT
+        C.ENCODING_PCM_24BIT -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            AudioFormat.ENCODING_PCM_24BIT_PACKED
+        } else {
+            0
+        }
+        C.ENCODING_PCM_32BIT -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            AudioFormat.ENCODING_PCM_32BIT
+        } else {
+            0
+        }
+        C.ENCODING_PCM_FLOAT -> AudioFormat.ENCODING_PCM_FLOAT
+        else -> 0
+    }
+
+    override fun setOutputStreamOffsetUs(outputStreamOffsetUs: Long) {
+        enhancedDelegate.setOutputStreamOffsetUs(outputStreamOffsetUs)
+        fallbackDelegate.setOutputStreamOffsetUs(outputStreamOffsetUs)
+    }
+
+    override fun enableTunnelingV21() {
+        enhancedDelegate.enableTunnelingV21()
+        fallbackDelegate.enableTunnelingV21()
+    }
+
+    override fun disableTunneling() {
+        enhancedDelegate.disableTunneling()
+        fallbackDelegate.disableTunneling()
+    }
+
+    override fun setOffloadMode(offloadMode: Int) {
+        enhancedDelegate.setOffloadMode(AudioSink.OFFLOAD_MODE_DISABLED)
+        fallbackDelegate.setOffloadMode(AudioSink.OFFLOAD_MODE_DISABLED)
+    }
+
+    override fun setOffloadDelayPadding(delayInFrames: Int, paddingInFrames: Int) {
+        enhancedDelegate.setOffloadDelayPadding(delayInFrames, paddingInFrames)
+        fallbackDelegate.setOffloadDelayPadding(delayInFrames, paddingInFrames)
+    }
+
+    override fun setVolume(volume: Float) {
+        // Recorded: Media3's audio-focus manager scales this on transient
+        // duck, bypassing ExoPlayer.getVolume. Bit-perfect verification must
+        // observe the gain that actually reaches AudioTrack, not the request.
+        lastVolume = volume
+        exclusiveUsb?.setVolume(volume)
+        // Exclusive usbdevfs never uses AudioTrack volume. Feature Unit
+        // volume (when present) keeps PCM untouched. Mixer BIT_PERFECT
+        // ignores AudioTrack volume, so the direct path pins platform gain
+        // at unity and scales in software only when exclusive is off.
+        val forwarded = if (usbExclusive || internalActive ||
+            (bitPerfectRequested && bitPerfectAtConfigure && !processingActive)
+        ) 1f else volume
+        enhancedDelegate.setVolume(forwarded)
+        fallbackDelegate.setVolume(forwarded)
+    }
+
+    /** Last gain reaching the output (1 = unity). */
+    fun currentVolume(): Float =
+        if (usbExclusive) exclusiveUsb?.softwareGain() ?: lastVolume else lastVolume
+
+    /**
+     * Reconciles platform gain after a (re)configure: unity on the direct
+     * bypass (software gain in handleDirectPassthrough owns it), otherwise
+     * the last requested volume.
+     */
+    private fun syncDelegateVolume() {
+        val forwarded = if (usbExclusive || internalActive ||
+            (bitPerfectRequested && bitPerfectAtConfigure && !processingActive)
+        ) 1f else lastVolume
+        runCatching { enhancedDelegate.setVolume(forwarded) }
+        runCatching { fallbackDelegate.setVolume(forwarded) }
+    }
+
+    override fun pause() {
+        playing = false
+        if (usbExclusive) {
+            // Media3 calls audioSink.pause() whenever the renderer stops for
+            // STATE_BUFFERING (e.g. refilling SampleQueue right after a
+            // forward seek). Setting exclusiveUsb.setPaused(true) here locks
+            // out handleBuffer() pre-fill and cuts off queued post-seek audio.
+            // User/focus pause state is driven by playWhenReady in MusicPlayer.
+            return
+        }
+        if (internalActive) {
+            internalDirect?.pause()
+            return
+        }
+        activeDelegate.pause()
+    }
+
+    override fun flush() {
+        directEq.reset()
+        directEqBuffer = null
+        clearPending()
+        clearEndOfStream()
+        exclusiveEnded = false
+        if (usbExclusive) {
+            exclusiveUsb?.flush()
+            // Drop converter state on seek: stale soxr delay would smear
+            // pre-seek audio into the new position. Rebuilt lazily on the
+            // next converted buffer.
+            pendingUsbFloat = null
+            if (exclusiveConvertSourceHz > 0) {
+                runCatching { processor.flush() }
+            }
+            return
+        }
+        if (internalActive) {
+            internalEnded = false
+            internalDirect?.flush()
+            pendingInternalFloat = null
+            if (exclusiveConvertSourceHz > 0) {
+                runCatching { processor.flush() }
+            }
+            return
+        }
+        if (processingActive) {
+            try {
+                processor.flush()
+                activeDelegate.flush()
+                return
+            } catch (error: Exception) {
+                if (!recoverProcessingPath("Processed flush failed", error)) throw error
+            } catch (error: LinkageError) {
+                if (!recoverProcessingPath("Processed flush linkage failed", error)) throw error
+            }
+        }
+        activeDelegate.flush()
+    }
+
+    override fun reset() {
+        directEq.reset()
+        directEqBuffer = null
+        usbOutput?.setFormat(null)
+        if (usbExclusive && exclusiveWanted) {
+            exclusiveUsb?.prepareForNextItem()
+            exclusiveEnded = false
+        } else {
+            exclusiveUsb?.reset()
+            usbExclusive = false
+            exclusiveEnded = false
+            exclusiveStartFailed = false
+        }
+        if (internalActive) {
+            // Keep the endpoint open: a same-format next item reuses it.
+            if (internalWanted) internalDirect?.prepareForNextItem() else internalDirect?.reset()
+        }
+        internalActive = false
+        internalEnded = false
+        internalStartFailed = false
+        pendingInternalFloat = null
+        clearPending()
+        clearEndOfStream()
+        configuredFormat = null
+        configuredBufferSize = 0
+        configuredOutputChannels = null
+        processedFormat = null
+        processingActive = false
+        playing = false
+        hasConfigured = false
+        bitPerfectAtConfigure = usbExclusive
+        clearExclusiveConverter()
+        notifyPlatformEffectsRequired(false)
+        safeResetProcessor()
+        safeReset(enhancedDelegate)
+        fallbackDelegate.reset()
+        activeDelegate = fallbackDelegate
+    }
+
+    override fun release() {
+        usbOutput?.setFormat(null)
+        if (usbExclusive) runCatching { exclusiveUsb?.reset() }
+        usbExclusive = false
+        exclusiveEnded = false
+        exclusiveStartFailed = false
+        if (internalActive) runCatching { internalDirect?.reset() }
+        internalActive = false
+        internalEnded = false
+        pendingInternalFloat = null
+        clearPending()
+        clearEndOfStream()
+        processedFormat = null
+        processingActive = false
+        playing = false
+        hasConfigured = false
+        bitPerfectAtConfigure = false
+        notifyPlatformEffectsRequired(false)
+        safeResetProcessor()
+        try {
+            enhancedDelegate.release()
+        } catch (error: Exception) {
+            Log.w(TAG, "Enhanced sink release failed", error)
+        } catch (error: LinkageError) {
+            Log.w(TAG, "Enhanced sink release linkage failed", error)
+        }
+        fallbackDelegate.release()
+    }
+
+    private fun recoverProcessingPath(reason: String, error: Throwable): Boolean =
+        if (activeDelegate === enhancedDelegate && switchToProcessedPcm16(reason, error)) {
+            true
+        } else {
+            switchToPlatformFallback(reason, error)
+        }
+
+    private fun switchToProcessedPcm16(reason: String, error: Throwable): Boolean {
+        val format = configuredFormat ?: return false
+        val floatFormat = processedFormat ?: return false
+        disableFloatOutput(reason, error)
+        clearPending()
+        clearEndOfStream()
+        safeFlush(enhancedDelegate)
+        return try {
+            processor.flush()
+            // A runtime output recovery retries the current untouched source
+            // buffer, so encoder delay must not be removed a second time.
+            processor.beginStream(0, format.encoderPadding)
+            fallbackDelegate.flush()
+            fallbackDelegate.configure(floatFormat, 0, configuredOutputChannels)
+            activeDelegate = fallbackDelegate
+            processingActive = true
+            configureUsbOutput(floatFormat, C.ENCODING_PCM_16BIT, configuredOutputChannels)
+            notifyPlatformEffectsRequired(false)
+            if (playing) fallbackDelegate.play()
+            Log.w(TAG, "Recovered with native Float32 DSP and PCM16 AudioTrack output")
+            true
+        } catch (fallbackError: Exception) {
+            Log.w(TAG, "Processed PCM16 recovery failed", fallbackError)
+            false
+        } catch (fallbackError: LinkageError) {
+            Log.w(TAG, "Processed PCM16 recovery linkage failed", fallbackError)
+            false
+        }
+    }
+
+    private fun switchToPlatformFallback(reason: String, error: Throwable): Boolean {
+        val format = configuredFormat ?: return false
+        disableNativePath(reason, error)
+        processingActive = false
+        clearPending()
+        clearEndOfStream()
+        processedFormat = null
+        safeResetProcessor()
+        safeFlush(enhancedDelegate)
+        return try {
+            fallbackDelegate.flush()
+            fallbackDelegate.configure(
+                format,
+                configuredBufferSize,
+                configuredOutputChannels,
+            )
+            activeDelegate = fallbackDelegate
+            notifyPlatformEffectsRequired(true)
+            configureUsbOutput(format, format.pcmEncoding, configuredOutputChannels)
+            if (playing) fallbackDelegate.play()
+            true
+        } catch (fallbackError: Exception) {
+            Log.e(TAG, "PCM16 fallback configuration failed", fallbackError)
+            false
+        } catch (fallbackError: LinkageError) {
+            Log.e(TAG, "PCM16 fallback linkage failed", fallbackError)
+            false
+        }
+    }
+
+    private fun disableFloatOutput(reason: String, error: Throwable) {
+        floatOutputDisabled = true
+        Log.w(TAG, "$reason; keeping native DSP through PCM16 compatibility output", error)
+        PlaybackDiagnostics.counter(PlaybackDiagnostics.nativeFallbacks, TAG, reason)
+    }
+
+    private fun disableNativePath(reason: String, error: Throwable?) {
+        nativePathDisabled = true
+        if (error != null) {
+            Log.w(TAG, "$reason; locking this player to conservative platform PCM", error)
+        } else {
+            Log.w(TAG, "$reason; locking this player to conservative platform PCM")
+        }
+        PlaybackDiagnostics.counter(PlaybackDiagnostics.nativeFallbacks, TAG, reason)
+        safeResetProcessor()
+    }
+
+    private fun notifyPlatformEffectsRequired(required: Boolean) {
+        try {
+            onPlatformEffectsRequired(required)
+        } catch (error: Exception) {
+            Log.w(TAG, "Platform effect routing notification failed", error)
+        } catch (error: LinkageError) {
+            Log.w(TAG, "Platform effect routing linkage failed", error)
+        }
+    }
+
+    private fun safeResetProcessor() {
+        try {
+            processor.reset()
+        } catch (error: Exception) {
+            Log.w(TAG, "Native processor reset failed", error)
+        } catch (error: LinkageError) {
+            Log.w(TAG, "Native processor reset linkage failed", error)
+        }
+    }
+
+    private fun safeFlush(delegate: DefaultAudioSink) {
+        try {
+            delegate.flush()
+        } catch (error: Exception) {
+            Log.w(TAG, "Inactive audio sink flush failed", error)
+        } catch (error: LinkageError) {
+            Log.w(TAG, "Inactive audio sink flush linkage failed", error)
+        }
+    }
+
+    private fun safeReset(delegate: DefaultAudioSink) {
+        try {
+            delegate.reset()
+        } catch (error: Exception) {
+            Log.w(TAG, "Enhanced audio sink reset failed", error)
+        } catch (error: LinkageError) {
+            Log.w(TAG, "Enhanced audio sink reset linkage failed", error)
+        }
+    }
+
+    private fun canProcess(format: Format): Boolean =
+        format.sampleMimeType == MimeTypes.AUDIO_RAW &&
+            format.sampleRate > 0 &&
+            format.channelCount in 1..2 &&
+            format.pcmEncoding in SUPPORTED_ENCODINGS
+
+    private fun asFloatProbeFormat(format: Format): Format =
+        format.buildUpon()
+            .setSampleMimeType(MimeTypes.AUDIO_RAW)
+            .setSampleRate(processor.outputSampleRateFor(format.sampleRate))
+            .setPcmEncoding(C.ENCODING_PCM_FLOAT)
+            .setEncoderDelay(0)
+            .setEncoderPadding(0)
+            .build()
+
+    private fun asFloatFormat(
+        format: Format,
+        outputFormat: AudioProcessor.AudioFormat,
+    ): Format = format.buildUpon()
+        .setSampleMimeType(MimeTypes.AUDIO_RAW)
+        .setSampleRate(outputFormat.sampleRate)
+        .setChannelCount(outputFormat.channelCount)
+        .setPcmEncoding(outputFormat.encoding)
+        .setEncoderDelay(0)
+        .setEncoderPadding(0)
+        .build()
+
+    private fun clearPending() {
+        pendingInputLimit = 0
+        pendingOutput = null
+        lastGainBuffer = null
+        pendingPresentationTimeUs = 0L
+        pendingAccessUnitCount = 0
+        pendingOutputFrameCount = 0
+    }
+
+    private fun clearEndOfStream() {
+        endOfStreamQueued = false
+        endOfStreamOutput = null
+        nextOutputPresentationTimeUs = 0L
+    }
+
+    private companion object {
+        const val TAG = "NativeAudioSink"
+        const val MICROS_PER_SECOND = 1_000_000L
+        val SUPPORTED_ENCODINGS = setOf(
+            C.ENCODING_PCM_16BIT,
+            C.ENCODING_PCM_24BIT,
+            C.ENCODING_PCM_32BIT,
+            C.ENCODING_PCM_FLOAT,
+        )
+    }
+}

@@ -1,0 +1,670 @@
+package com.nlx.music.data.playlist
+
+import android.util.Log
+import androidx.compose.runtime.Immutable
+import com.nlx.music.data.local.db.SavedPlaylistDao
+import com.nlx.music.data.local.db.SavedPlaylistEntity
+import com.nlx.music.data.generate.GeneratedTrack
+import com.nlx.music.data.generate.isLocalFile
+import com.nlx.music.data.generate.StoredTrack
+import com.nlx.music.data.generate.pinnedWithVideoIdsPreserving
+import com.nlx.music.data.generate.sameSongAs
+import com.nlx.music.data.generate.toGenerated
+import com.nlx.music.data.generate.toStored
+import com.nlx.music.data.generate.youtubeVideoIdOrNull
+import com.nlx.music.data.music.InnerTubeMusicApi
+import com.nlx.music.util.FileExportHelper
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.launch
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import javax.inject.Inject
+import javax.inject.Singleton
+import java.util.concurrent.atomic.AtomicBoolean
+
+/** Port of playlist.js's `lw_playlists` model: id, title, subtitle, mode,
+ *  tracks, date. [id] doubles as the creation timestamp (matches the
+ *  original's `Date.now()`-based id). */
+@Immutable
+data class SavedPlaylist(
+    val id: Long,
+    val title: String,
+    val subtitle: String,
+    val mode: String,
+    val tracks: List<GeneratedTrack>,
+    val createdAtMillis: Long,
+    val discoverSignature: String? = null,
+    val customCoverUri: String? = null,
+    val isPinned: Boolean = false,
+    /** Non-null only for a connected-account playlist that has not been made local. */
+    val remotePlaylistId: String? = null,
+    val remoteArtworkUrl: String? = null,
+    val remoteTrackCount: Int? = null,
+)
+
+val SavedPlaylist.isYouTubeOnly: Boolean
+    get() = remotePlaylistId != null
+
+private const val MAX_SAVED_PLAYLISTS = 20
+private const val STARTUP_SYNC_WAIT_MS = 2_000L
+private const val TAG = "PlaylistRepository"
+const val LIKED_SONGS_MODE = "liked"
+const val LIKED_SONGS_TITLE = "Liked Songs"
+/** Built-in playlist holding audio files imported from the device. */
+const val LOCAL_SONGS_MODE = "local"
+const val LOCAL_SONGS_TITLE = "Local songs"
+
+@Singleton
+class PlaylistRepository @Inject constructor(
+    private val dao: SavedPlaylistDao,
+    private val fileExportHelper: FileExportHelper,
+    private val exportEvents: PlaylistExportEvents,
+    private val publicMirror: PlaylistPublicMirror,
+    private val innerTube: InnerTubeMusicApi,
+) {
+    private val json = Json { ignoreUnknownKeys = true }
+    private val _changes = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val changes = _changes.asSharedFlow()
+    private val likedSongsMutex = Mutex()
+    private val saveMutex = Mutex()
+
+    val playlists: Flow<List<SavedPlaylist>> = flow {
+        try {
+            emit(getAll())
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Log.e(TAG, "Initial playlist read failed", error)
+            emit(emptyList())
+        }
+        changes.collect {
+            // A failed re-read must not tear down every collector (the UI plus
+            // the YT library projection collect this flow): keep serving the
+            // last good list until the next change event.
+            val updated = try {
+                getAll()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Log.e(TAG, "Playlist re-read failed", error)
+                null
+            }
+            if (updated != null) emit(updated)
+        }
+    }
+
+    // Fire-and-forget scope for the public Downloads export copy — outlives
+    // any single screen's viewModelScope (it's a Singleton), and its own
+    // failure must never fail or delay save() itself.
+    private val exportScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val startupSync = exportScope.async {
+        runCatching { publicMirror.restoreIfDatabaseEmpty() }
+            .onSuccess { restored ->
+                if (restored > 0) _changes.tryEmit(Unit)
+            }
+            .onFailure { error ->
+                Log.e(TAG, "Playlist JSON startup sync failed; continuing with Room", error)
+            }
+    }
+    @Volatile private var startupSyncTimedOut = false
+
+    private suspend fun awaitStartupSync() {
+        if (startupSyncTimedOut) return
+        if (withTimeoutOrNull(STARTUP_SYNC_WAIT_MS) { startupSync.await() } == null) {
+            startupSyncTimedOut = true
+        }
+    }
+
+    private suspend fun filterPlayable(tracks: List<GeneratedTrack>): List<GeneratedTrack> =
+        tracks.pinnedWithVideoIdsPreserving(innerTube)
+
+    private val videoIdBackfillOnce = AtomicBoolean(false)
+
+    private fun GeneratedTrack.needsVideoIdBackfill(): Boolean =
+        !isLocalFile() && youtubeVideoIdOrNull() == null && name.isNotBlank()
+
+    /** One-shot per process: pins ids for rows saved before list-time pinning
+     *  existed, then persists them so the work never repeats. Fire-and-forget
+     *  on [exportScope]; playback never waits on it. Strictly preserves all tracks. */
+    private fun backfillMissingVideoIdsOnce(loaded: List<SavedPlaylist>) {
+        if (loaded.none { playlist ->
+            playlist.tracks.any { it.needsVideoIdBackfill() }
+        }) return
+        if (!videoIdBackfillOnce.compareAndSet(false, true)) return
+        exportScope.launch {
+            try {
+                var changed = false
+                for (entity in dao.getAll()) {
+                    val domain = runCatching { entity.toDomain() }.getOrNull() ?: continue
+                    if (domain.tracks.none { it.needsVideoIdBackfill() }) continue
+                    val pinned = domain.tracks.pinnedWithVideoIdsPreserving(innerTube)
+                    val hasNewPins = pinned.zip(domain.tracks).any { (newTrack, oldTrack) -> newTrack.url != oldTrack.url }
+                    if (!hasNewPins) continue
+                    dao.upsert(entity.copy(tracksJson = json.encodeToString(pinned.map { it.toStored() })))
+                    changed = true
+                }
+                if (changed) _changes.tryEmit(Unit)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (e: Exception) {
+                Log.e(TAG, "VideoId backfill failed; will retry next launch", e)
+                videoIdBackfillOnce.set(false)
+            }
+        }
+    }
+
+
+    /** Newest first — matches _plRenderSaved()'s display order (the
+     *  original reverses its append-ordered array before rendering). */
+    suspend fun getAll(): List<SavedPlaylist> {
+        return try {
+            dao.getAll().toDomainSorted()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Log.e(TAG, "Failed to read playlists from Room DAO", error)
+            // Transient failure (e.g. a sync write holding the database lock,
+            // a settling migration): retry the live read once before giving
+            // up on it.
+            val retried = try {
+                dao.getAll()
+            } catch (retryError: CancellationException) {
+                throw retryError
+            } catch (retryError: Exception) {
+                Log.w(TAG, "Playlist read retry failed", retryError)
+                null
+            }
+            if (retried != null) return retried.toDomainSorted()
+            // Only a genuinely empty database may be repopulated from the
+            // public mirror — that is exactly what restoreIfDatabaseEmpty()
+            // checks. A non-empty database means the read itself failed.
+            val restored = try {
+                publicMirror.restoreIfDatabaseEmpty()
+            } catch (restoreError: CancellationException) {
+                throw restoreError
+            } catch (restoreError: Exception) {
+                Log.w(TAG, "Public mirror restore check failed", restoreError)
+                0
+            }
+            if (restored > 0) {
+                val recovered = try {
+                    dao.getAll()
+                } catch (recoveredError: CancellationException) {
+                    throw recoveredError
+                } catch (recoveredError: Exception) {
+                    Log.w(TAG, "Playlist read after mirror restore failed", recoveredError)
+                    null
+                }
+                if (recovered != null) return recovered.toDomainSorted()
+            }
+            // Never substitute the public mirror snapshot for a failed read.
+            // That file lags behind Room, and callers treat this list as
+            // authoritative: the YouTube sync's orphan sweep deletes the
+            // user's remote mirrors for every playlist merely missing from a
+            // stale snapshot, the Liked Songs bootstrap stacks a duplicate
+            // row, and save()'s dedupe stacks same-title siblings. Surface
+            // the failure instead so each caller skips the operation —
+            // display callers already catch a throwing read.
+            throw error
+        }
+    }
+
+    private fun List<SavedPlaylistEntity>.toDomainSorted(): List<SavedPlaylist> =
+        mapNotNull { entity ->
+            runCatching { entity.toDomain() }.getOrNull()
+        }
+            .sortedByDescending { it.createdAtMillis }
+            .also { backfillMissingVideoIdsOnce(it) }
+
+    suspend fun getById(id: Long): SavedPlaylist? {
+        return try {
+            dao.getById(id)?.toDomain() ?: getAll().firstOrNull { it.id == id }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get playlist $id from Room DAO", e)
+            try {
+                getAll().firstOrNull { it.id == id }
+            } catch (fallbackError: CancellationException) {
+                throw fallbackError
+            } catch (fallbackError: Exception) {
+                Log.e(TAG, "Fallback playlist lookup failed for $id", fallbackError)
+                null
+            }
+        }
+    }
+
+    /**
+     * Saves a new playlist. Guards against accidental double-saves the same
+     * way the original's savePlaylist() does: skips saving only when an existing
+     * playlist has the same title and complete ordered track identity.
+     * Returns the saved playlist, or the pre-existing duplicate if skipped.
+     */
+    suspend fun save(title: String, subtitle: String, mode: String, tracks: List<GeneratedTrack>, discoverSignature: String? = null): SavedPlaylist = saveMutex.withLock {
+        val existing = getAll()
+        val rawTracks = if (mode == LIKED_SONGS_MODE) {
+            val seen = mutableListOf<GeneratedTrack>()
+            tracks.forEach { t -> if (seen.none { it.sameSongAs(t) }) seen.add(t) }
+            seen
+        } else tracks
+        val playableTracks = if (mode == "custom" && tracks.isEmpty()) emptyList() else filterPlayable(rawTracks)
+        existing.firstOrNull {
+            it.mode == mode &&
+                it.title.equals(title, ignoreCase = true) &&
+                sameOrderedTrackIdentity(it.tracks, playableTracks)
+        }
+            ?.let { return@withLock it }
+
+        // Same title+mode but different content (double-tap generate race,
+        // re-import, progressive album save): suffix instead of stacking an
+        // identical-titled sibling that reads as a duplication bug.
+        var finalTitle = title
+        if (existing.any { it.mode == mode && it.title.equals(finalTitle, ignoreCase = true) }) {
+            var counter = 2
+            while (existing.any { it.mode == mode && it.title.equals(finalTitle, ignoreCase = true) }) {
+                finalTitle = "$title $counter"
+                counter++
+            }
+        }
+
+        val entity = SavedPlaylistEntity(
+            id = maxOf(System.currentTimeMillis(), (existing.maxOfOrNull { it.id } ?: 0L) + 1L),
+            title = finalTitle,
+            subtitle = subtitle,
+            mode = mode,
+            tracksJson = json.encodeToString(playableTracks.map { it.toStored() }),
+            createdAtMillis = System.currentTimeMillis(),
+            discoverSignature = discoverSignature,
+        )
+        try {
+            dao.upsert(entity)
+            dao.trimGeneratedToNewest(MAX_SAVED_PLAYLISTS)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to upsert playlist entity in Room", e)
+        }
+        val saved = entity.toDomain()
+        syncPublicMirrorInBackground()
+        _changes.tryEmit(Unit)
+
+        // Best-effort copy to the public Downloads folder. Room is already
+        // the source of truth the app reads from, so this never blocks the
+        // caller — and a failure here doesn't mean the playlist was lost.
+        if (mode != "custom" && tracks.isNotEmpty()) {
+            exportScope.launch {
+                fileExportHelper.savePlaylistToPublicDownloads(saved.title, saved.tracks)
+                    .onFailure { e ->
+                        Log.e(TAG, "Public Downloads export failed for \"${saved.title}\"", e)
+                    }
+            }
+        }
+
+        saved
+    }
+
+    private fun sameOrderedTrackIdentity(
+        existing: List<GeneratedTrack>,
+        incoming: List<GeneratedTrack>,
+    ): Boolean = existing.size == incoming.size && existing.zip(incoming).all { (left, right) ->
+        left.sameSongAs(right)
+    }
+
+    /**
+     * Newest playlist with this title in the given mode (custom album saves
+     * included), or null. Lets callers detect an already-saved album without
+     * creating a same-title duplicate.
+     */
+    suspend fun findByTitle(title: String, mode: String = "custom"): SavedPlaylist? {
+        val cleanTitle = title.trim()
+        if (cleanTitle.isBlank() || cleanTitle.equals(LIKED_SONGS_TITLE, ignoreCase = true)) return null
+        return runCatching { getAll() }.getOrDefault(emptyList())
+            .firstOrNull { it.mode == mode && it.title.equals(cleanTitle, ignoreCase = true) }
+    }
+
+    suspend fun createCustom(title: String): SavedPlaylist {
+        val cleanTitle = title.trim()
+        if (cleanTitle.equals(LIKED_SONGS_TITLE, ignoreCase = true)) return ensureLikedSongs()
+        runCatching { getAll() }.getOrDefault(emptyList()).firstOrNull {
+            it.mode == "custom" && it.title.equals(cleanTitle, ignoreCase = true)
+        }
+            ?.let { return it }
+        return save(
+            title = cleanTitle,
+            subtitle = "Custom playlist",
+            mode = "custom",
+            tracks = emptyList(),
+        )
+    }
+
+    suspend fun rename(id: Long, title: String): SavedPlaylist? {
+        awaitStartupSync()
+        val entity = dao.getById(id) ?: return null
+        val cleanTitle = title.trim()
+        if (entity.mode == LIKED_SONGS_MODE || cleanTitle.equals(LIKED_SONGS_TITLE, ignoreCase = true)) {
+            return entity.toDomain()
+        }
+        if (cleanTitle.isBlank()) return entity.toDomain()
+        val updated = entity.copy(title = cleanTitle)
+        dao.upsert(updated)
+        syncPublicMirror()
+        _changes.tryEmit(Unit)
+        return updated.toDomain()
+    }
+
+    suspend fun setCustomCover(id: Long, uri: String?): SavedPlaylist? {
+        awaitStartupSync()
+        val entity = dao.getById(id) ?: return null
+        val cleanUri = uri?.trim()?.takeIf { it.isNotBlank() }
+        val updated = entity.copy(customCoverUri = cleanUri)
+        dao.upsert(updated)
+        syncPublicMirror()
+        _changes.tryEmit(Unit)
+        return updated.toDomain()
+    }
+
+    suspend fun setPinned(id: Long, pinned: Boolean): SavedPlaylist? {
+        awaitStartupSync()
+        val entity = dao.getById(id) ?: return null
+        if (entity.isPinned == pinned) return entity.toDomain()
+        val updated = entity.copy(isPinned = pinned)
+        dao.upsert(updated)
+        syncPublicMirror()
+        _changes.tryEmit(Unit)
+        return updated.toDomain()
+    }
+
+    /**
+     * Appends a track, serialized through [saveMutex] like [moveTrack]: the
+     * duplicate check reads the just-written row, so a double-tap (or a
+     * confirm dialog tapped twice) can never stack the same track twice.
+     */
+    suspend fun addTrack(
+        id: Long,
+        track: GeneratedTrack,
+        allowDuplicate: Boolean = false,
+    ): SavedPlaylist? {
+        awaitStartupSync()
+        return saveMutex.withLock {
+            val entity = dao.getById(id) ?: return@withLock null
+            val playlist = entity.toDomain()
+            if (playlist.mode != "custom" && playlist.mode != LIKED_SONGS_MODE) return@withLock playlist
+            if ((playlist.mode == LIKED_SONGS_MODE || !allowDuplicate) && playlist.tracks.any { it.sameSongAs(track) }) return@withLock playlist
+            // An imported file is playable by definition (it is on disk). If unpinned, try to resolve YouTube ID, but always keep the track.
+            val trackToAdd = if (!track.isLocalFile() && track.youtubeVideoIdOrNull() == null) {
+                runCatching {
+                    innerTube.findBestMatchOrNull(track.name, track.artist, prefetchStreams = false)?.let { match ->
+                        track.copy(
+                            name = track.name.ifBlank { match.title },
+                            artist = track.artist.ifBlank { match.artist },
+                            album = track.album ?: match.album,
+                            artworkUrl = track.artworkUrl ?: match.artworkUrl,
+                            url = "https://music.youtube.com/watch?v=${match.videoId}",
+                        )
+                    }
+                }.getOrNull() ?: track
+            } else {
+                track
+            }
+            val updatedTracksJson = json.encodeToString((playlist.tracks + trackToAdd).map { it.toStored() })
+            val updated = entity.copy(tracksJson = updatedTracksJson)
+            dao.upsert(updated)
+            syncPublicMirror()
+            _changes.tryEmit(Unit)
+            updated.toDomain()
+        }
+    }
+
+    suspend fun removeTrack(id: Long, index: Int): SavedPlaylist? {
+        awaitStartupSync()
+        return saveMutex.withLock {
+            val entity = dao.getById(id) ?: return@withLock null
+            val playlist = entity.toDomain()
+            if (index !in playlist.tracks.indices) return@withLock playlist
+            val updatedTracks = playlist.tracks.toMutableList().apply { removeAt(index) }
+            val updated = entity.copy(tracksJson = json.encodeToString(updatedTracks.map { it.toStored() }))
+            dao.upsert(updated)
+            syncPublicMirror()
+            _changes.tryEmit(Unit)
+            updated.toDomain()
+        }
+    }
+
+    /**
+     * Permanently moves a track within a local playlist and persists the new
+     * order to Room (source of truth). No-op for out-of-range indices.
+     * Serialized through [saveMutex]: a drag fires one persist per crossed
+     * row, and concurrent read-modify-writes would otherwise lose moves so
+     * the order snaps back instead of sticking.
+     */
+    suspend fun moveTrack(id: Long, fromIndex: Int, toIndex: Int): SavedPlaylist? {
+        if (fromIndex == toIndex) return getById(id)
+        awaitStartupSync()
+        return saveMutex.withLock {
+            val entity = dao.getById(id) ?: return@withLock null
+            val playlist = entity.toDomain()
+            if (fromIndex !in playlist.tracks.indices || toIndex !in playlist.tracks.indices) return@withLock playlist
+            val updatedTracks = playlist.tracks.toMutableList().apply {
+                add(toIndex, removeAt(fromIndex))
+            }
+            val updated = entity.copy(tracksJson = json.encodeToString(updatedTracks.map { it.toStored() }))
+            dao.upsert(updated)
+            syncPublicMirror()
+            _changes.tryEmit(Unit)
+            updated.toDomain()
+        }
+    }
+
+    suspend fun getLocalSongs(): SavedPlaylist? =
+        getAll().firstOrNull { it.mode == LOCAL_SONGS_MODE }
+
+    /** Creates the built-in "Local songs" playlist (pinned) when absent. */
+    suspend fun ensureLocalSongs(): SavedPlaylist = likedSongsMutex.withLock {
+        getLocalSongs()?.let { return@withLock it }
+        val created = save(
+            title = LOCAL_SONGS_TITLE,
+            subtitle = "Audio files imported from this device",
+            mode = LOCAL_SONGS_MODE,
+            tracks = emptyList(),
+        )
+        setPinned(created.id, true) ?: created.copy(isPinned = true)
+    }
+
+    /**
+     * Merges an import pass into "Local songs" under [saveMutex], so a
+     * removal made in the UI while a scan runs is never overwritten. Rows
+     * whose file path is in [updates] get the fresh metadata; [additions]
+     * not already present (by path) are appended in order.
+     */
+    suspend fun mergeLocalSongs(
+        updates: Map<String, GeneratedTrack>,
+        additions: List<GeneratedTrack>,
+    ): SavedPlaylist? {
+        val target = ensureLocalSongs()
+        return saveMutex.withLock {
+            val entity = dao.getById(target.id) ?: return@withLock null
+            val current = entity.toDomain().tracks
+            val present = current.mapTo(mutableSetOf()) { it.url }
+            val merged = current.map { updates[it.url] ?: it } +
+                additions.filter { present.add(it.url) }
+            if (merged == current) return@withLock entity.toDomain()
+            val updated = entity.copy(tracksJson = json.encodeToString(merged.map { it.toStored() }))
+            dao.upsert(updated)
+            syncPublicMirror()
+            _changes.tryEmit(Unit)
+            updated.toDomain()
+        }
+    }
+
+    suspend fun getLikedSongs(): SavedPlaylist? =
+        getAll().firstOrNull { it.mode == LIKED_SONGS_MODE }
+
+    /** Creates the built-in local playlist only when it is genuinely absent. */
+    suspend fun ensureLikedSongs(): SavedPlaylist = likedSongsMutex.withLock {
+        getLikedSongs()?.let { return@withLock it }
+        getAll().firstOrNull { it.title.equals(LIKED_SONGS_TITLE, ignoreCase = true) }?.let { legacy ->
+            val entity = dao.getById(legacy.id)
+            if (entity != null) {
+                val adopted = entity.copy(
+                    title = LIKED_SONGS_TITLE,
+                    subtitle = "Songs you like in NLX_ MUSIC",
+                    mode = LIKED_SONGS_MODE,
+                    isPinned = true,
+                )
+                dao.upsert(adopted)
+                syncPublicMirror()
+                _changes.tryEmit(Unit)
+                return@withLock adopted.toDomain()
+            }
+        }
+        val created = save(
+            title = LIKED_SONGS_TITLE,
+            subtitle = "Songs you like in NLX_ MUSIC",
+            mode = LIKED_SONGS_MODE,
+            tracks = emptyList(),
+        )
+        setPinned(created.id, true) ?: created.copy(isPinned = true)
+    }
+
+    /** Internal sync write: unlike normal editing, this also updates generated/imported playlists. */
+    suspend fun replaceTracksForSync(
+        id: Long,
+        tracks: List<GeneratedTrack>,
+        expectedTracks: List<GeneratedTrack>? = null,
+    ): SavedPlaylist? {
+        awaitStartupSync()
+        val entity = dao.getById(id) ?: return null
+        if (expectedTracks != null && entity.toDomain().tracks != expectedTracks) return null
+        val updated = entity.copy(tracksJson = json.encodeToString(tracks.map { it.toStored() }))
+        if (dao.updateTracksIfUnchanged(id, entity.tracksJson, updated.tracksJson) == 0) return null
+        syncPublicMirror()
+        _changes.tryEmit(Unit)
+        return updated.toDomain()
+    }
+
+    /**
+     * Persists a YouTube videoId learned at playback time onto stored rows
+     * holding the same song (Liked Songs, saved playlists). Blank-id rows
+     * always take the id; rows pinned to [replaceVideoId] take it only when
+     * that is exactly the dead id being replaced. Other existing ids are
+     * never overwritten, and the queue is never reordered or dropped.
+     * Serialized through [saveMutex]; best-effort — returns rows updated.
+     */
+    suspend fun pinVideoIdForSong(
+        song: GeneratedTrack,
+        videoId: String,
+        replaceVideoId: String? = null,
+    ): Int {
+        if (videoId.isBlank() || song.name.isBlank()) return 0
+        awaitStartupSync()
+        return saveMutex.withLock {
+            var changed = 0
+            for (entity in dao.getAll()) {
+                val domain = runCatching { entity.toDomain() }.getOrNull() ?: continue
+                val pinned = domain.tracks.map { track ->
+                    val existingId = track.youtubeVideoIdOrNull()
+                    val eligible = !track.isLocalFile() && track.sameSongAs(song) &&
+                        (existingId == null || (replaceVideoId != null && existingId == replaceVideoId))
+                    if (eligible) {
+                        track.copy(url = "https://music.youtube.com/watch?v=$videoId")
+                    } else {
+                        track
+                    }
+                }
+                if (pinned == domain.tracks) continue
+                if (replaceTracksForSync(entity.id, pinned, domain.tracks) != null) changed++
+            }
+            changed
+        }
+    }
+
+    suspend fun delete(id: Long) {
+        awaitStartupSync()
+        dao.deleteById(id)
+        syncPublicMirror()
+        _changes.tryEmit(Unit)
+    }
+
+    suspend fun clearAll() {
+        awaitStartupSync()
+        dao.clear()
+        syncPublicMirror()
+        _changes.tryEmit(Unit)
+    }
+
+    fun publicMirrorPlaylistCount(content: String): Int? = publicMirror.playlistCount(content)
+
+    suspend fun importPublicMirror(content: String): Result<Int> {
+        awaitStartupSync()
+        return publicMirror.importAndMerge(content).onSuccess { _changes.tryEmit(Unit) }
+    }
+
+    suspend fun titles(): List<String> = getAll().map { it.title }
+
+    /** Order-preserving signature of a Discover feed's visible tracks — port
+     *  of _discTrackSignature(): used to detect "this exact feed is already
+     *  saved" before creating a duplicate. */
+    fun discoverSignature(tracks: List<GeneratedTrack>): String =
+        tracks.joinToString("|") { it.key }
+
+    suspend fun findByDiscoverSignature(signature: String): SavedPlaylist? =
+        getAll().firstOrNull { it.discoverSignature == signature }
+
+    private suspend fun syncPublicMirror() {
+        publicMirror.writeFromDatabase().onFailure { e ->
+            Log.e(TAG, "Public playlist JSON sync failed", e)
+        }
+    }
+
+    private fun syncPublicMirrorInBackground() {
+        exportScope.launch { syncPublicMirror() }
+    }
+
+    private fun SavedPlaylistEntity.toDomain(): SavedPlaylist {
+        val tracks = try {
+            json.decodeFromString<List<StoredTrack>>(tracksJson).map { it.toGenerated() }
+        } catch (e: Exception) {
+            Log.w(TAG, "Standard decode failed for playlist $id tracks, trying resilient element decode", e)
+            try {
+                val element = json.parseToJsonElement(tracksJson)
+                if (element is JsonArray) {
+                    element.mapNotNull { trackElement ->
+                        runCatching {
+                            json.decodeFromJsonElement(StoredTrack.serializer(), trackElement).toGenerated()
+                        }.getOrNull()
+                    }
+                } else {
+                    emptyList()
+                }
+            } catch (fallbackError: Exception) {
+                Log.e(TAG, "Resilient decode failed for playlist $id tracks", fallbackError)
+                emptyList()
+            }
+        }
+        return SavedPlaylist(
+            id = id,
+            title = title,
+            subtitle = subtitle,
+            mode = mode,
+            tracks = tracks,
+            createdAtMillis = createdAtMillis,
+            discoverSignature = discoverSignature,
+            customCoverUri = customCoverUri,
+            isPinned = isPinned,
+        )
+    }
+}

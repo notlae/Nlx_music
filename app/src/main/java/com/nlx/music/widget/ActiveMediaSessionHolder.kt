@@ -1,0 +1,28 @@
+package com.nlx.music.widget
+
+import android.media.session.MediaController
+
+/**
+ * The single most-recently-active [MediaController], shared in-process
+ * between the playback service and the Now Playing widget's tap actions (play/pause, skip).
+ *
+ * Deliberately NOT persisted anywhere — a MediaController is only valid
+ * for the lifetime of the session it points to, so on process death this
+ * naturally goes back to null until the service reconnects and rebinds a
+ * live session. The widget's own displayed text/art/playing-state DOES
+ * persist across process death (see [WidgetUpdater] / [WidgetSnapshot],
+ * SharedPreferences-backed) — only the transport-control target
+ * lives here.
+ */
+object ActiveMediaSessionHolder {
+    @Volatile var controller: MediaController? = null
+    @Volatile var ownToken: android.media.session.MediaSession.Token? = null
+
+    fun clear(expected: MediaController) {
+        if (controller?.sessionToken == expected.sessionToken) controller = null
+    }
+
+    fun clearToken(expected: android.media.session.MediaSession.Token?) {
+        if (expected != null && ownToken == expected) ownToken = null
+    }
+}

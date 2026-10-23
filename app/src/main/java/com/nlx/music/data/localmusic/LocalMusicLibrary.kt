@@ -1,0 +1,432 @@
+package com.nlx.music.data.localmusic
+
+import android.content.Context
+import android.content.Intent
+import android.media.MediaMetadataRetriever
+import android.net.Uri
+import android.provider.DocumentsContract
+import android.util.Log
+import com.nlx.music.data.generate.GeneratedTrack
+import com.nlx.music.data.generate.LocalAudioFormats
+import com.nlx.music.data.generate.isLocalFile
+import com.nlx.music.data.playlist.PlaylistRepository
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.io.File
+import java.security.MessageDigest
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Feature "Local songs": imports audio files from folders the user picks
+ * (Storage Access Framework tree), copies them into app-private storage and
+ * lists them in the built-in "Local songs" playlist.
+ *
+ * - Copies, not references: the playlist keeps working if the source folder
+ *   is moved, the SD card is removed or the permission is revoked.
+ * - Re-scan is incremental: a file is identified by (folder, document id),
+ *   so it is copied once; an unchanged size skips the copy and the tag read.
+ * - Tags (title / artist / album), embedded cover, a folder cover
+ *   (cover/folder/front.jpg|png) and a sidecar `.lrc` with the same base name
+ *   are imported alongside.
+ */
+@Singleton
+class LocalMusicLibrary @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val playlistRepository: PlaylistRepository,
+) {
+    data class ImportReport(
+        val added: Int = 0,
+        val updated: Int = 0,
+        val unchanged: Int = 0,
+        /** Extension -> count of audio files this player cannot open. */
+        val unsupported: Map<String, Int> = emptyMap(),
+        val failed: Int = 0,
+        val bytesCopied: Long = 0L,
+        val unreachableFolders: Int = 0,
+        val outOfSpace: Boolean = false,
+    )
+
+    sealed interface ImportState {
+        data object Idle : ImportState
+        data class Scanning(val filesFound: Int) : ImportState
+        data class Copying(val done: Int, val total: Int, val currentName: String) : ImportState
+        data class Finished(val report: ImportReport) : ImportState
+    }
+
+    private data class AudioEntry(
+        val treeUri: Uri,
+        val documentId: String,
+        val displayName: String,
+        val size: Long,
+        val lrcDocumentId: String?,
+        val coverDocumentId: String?,
+    )
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mutex = Mutex()
+    private var job: Job? = null
+    private val prefs by lazy { context.getSharedPreferences(PREFS, Context.MODE_PRIVATE) }
+
+    private val root: File get() = File(context.filesDir, DIR).apply { mkdirs() }
+    private val artDir: File get() = File(root, ART_DIR).apply { mkdirs() }
+
+    private val _state = MutableStateFlow<ImportState>(ImportState.Idle)
+    val state: StateFlow<ImportState> = _state.asStateFlow()
+
+    private val _folders = MutableStateFlow(loadFolders())
+    val folders: StateFlow<List<Uri>> = _folders.asStateFlow()
+
+    val isRunning: Boolean get() = job?.isActive == true
+
+    /** Persists read access to [treeUri], remembers it and imports it. */
+    fun addFolderAndImport(treeUri: Uri) {
+        runCatching {
+            context.contentResolver.takePersistableUriPermission(treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }.onFailure { Log.w(TAG, "No persistable grant for $treeUri; rescan may fail later", it) }
+        val updated = (_folders.value.filterNot { it == treeUri } + treeUri)
+        saveFolders(updated)
+        launchImport(listOf(treeUri))
+    }
+
+    /** Re-imports every remembered folder (new files are added, changed ones refreshed). */
+    fun rescanAll() {
+        launchImport(_folders.value)
+    }
+
+    /** Forgets a folder (releases the grant). Already-copied songs stay in "Local songs". */
+    fun forgetFolder(treeUri: Uri) {
+        runCatching {
+            context.contentResolver.releasePersistableUriPermission(treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        saveFolders(_folders.value.filterNot { it == treeUri })
+    }
+
+    fun acknowledgeReport() {
+        if (_state.value is ImportState.Finished) _state.value = ImportState.Idle
+    }
+
+    fun folderLabel(treeUri: Uri): String {
+        val docId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull() ?: return treeUri.toString()
+        // "primary:Music/Albums" -> "Music/Albums"; SD cards keep their volume id.
+        val (volume, path) = docId.substringBefore(':') to docId.substringAfter(':', "")
+        return when {
+            path.isBlank() -> if (volume == "primary") "Internal storage" else volume
+            volume == "primary" -> path
+            else -> "$volume/$path"
+        }
+    }
+
+    private fun launchImport(folders: List<Uri>) {
+        if (folders.isEmpty() || isRunning) return
+        job = scope.launch {
+            mutex.withLock {
+                _state.value = ImportState.Scanning(0)
+                val report = try {
+                    runImport(folders)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.e(TAG, "Local import failed", e)
+                    ImportReport(failed = 1)
+                }
+                _state.value = ImportState.Finished(report)
+            }
+        }
+    }
+
+    private suspend fun runImport(folders: List<Uri>): ImportReport {
+        val entries = mutableListOf<AudioEntry>()
+        val unsupported = mutableMapOf<String, Int>()
+        var unreachable = 0
+        for (tree in folders) {
+            val rootDocId = runCatching { DocumentsContract.getTreeDocumentId(tree) }.getOrNull()
+            if (rootDocId == null || !walk(tree, rootDocId, 0, entries, unsupported)) unreachable++
+        }
+
+        val existing = playlistRepository.ensureLocalSongs().tracks.associateBy { it.url }
+        val needed = entries.sumOf { entry ->
+            val dest = destinationFor(entry)
+            if (dest.exists() && dest.length() == entry.size) 0L else entry.size
+        }
+        if (needed > 0 && needed + SPACE_MARGIN_BYTES > root.usableSpace) {
+            return ImportReport(unsupported = unsupported, unreachableFolders = unreachable, outOfSpace = true)
+        }
+
+        val updates = mutableMapOf<String, GeneratedTrack>()
+        val additions = mutableListOf<GeneratedTrack>()
+        var unchanged = 0
+        var failed = 0
+        var bytes = 0L
+        entries.forEachIndexed { index, entry ->
+            currentCoroutineContext().ensureActive()
+            _state.value = ImportState.Copying(index, entries.size, entry.displayName)
+            try {
+                val dest = destinationFor(entry)
+                val sameFile = dest.exists() && dest.length() == entry.size
+                if (!sameFile) {
+                    copyDocument(entry.treeUri, entry.documentId, dest)
+                    bytes += dest.length()
+                }
+                entry.lrcDocumentId?.let { lrcId ->
+                    runCatching { copyDocument(entry.treeUri, lrcId, File(LocalAudioFormats.lrcPathFor(dest.path))) }
+                }
+                val path = dest.absolutePath
+                val known = existing[path]
+                if (sameFile && known != null) {
+                    unchanged++
+                } else {
+                    val track = readTrack(dest, entry)
+                    if (known != null) updates[path] = track else additions += track
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Couldn't import ${entry.displayName}", e)
+                failed++
+            }
+        }
+        _state.value = ImportState.Copying(entries.size, entries.size, "")
+        if (updates.isNotEmpty() || additions.isNotEmpty()) {
+            playlistRepository.mergeLocalSongs(updates, additions)
+        }
+        return ImportReport(
+            added = additions.size,
+            updated = updates.size,
+            unchanged = unchanged,
+            unsupported = unsupported,
+            failed = failed,
+            bytesCopied = bytes,
+            unreachableFolders = unreachable,
+        )
+    }
+
+    /** Depth-first walk of a SAF tree. Returns false when the folder can't be listed. */
+    private suspend fun walk(
+        tree: Uri,
+        parentDocId: String,
+        depth: Int,
+        out: MutableList<AudioEntry>,
+        unsupported: MutableMap<String, Int>,
+    ): Boolean {
+        currentCoroutineContext().ensureActive()
+        if (depth > MAX_DEPTH) return true
+        data class Child(val id: String, val name: String, val mime: String?, val size: Long)
+        val children = mutableListOf<Child>()
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentDocId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE,
+        )
+        val ok = runCatching {
+            context.contentResolver.query(childrenUri, projection, null, null, null)?.use { c ->
+                while (c.moveToNext()) {
+                    val id = c.getString(0)
+                    if (id != null) {
+                        children += Child(
+                            id = id,
+                            name = c.getString(1).orEmpty(),
+                            mime = c.getString(2),
+                            size = if (c.isNull(3)) -1L else c.getLong(3),
+                        )
+                    }
+                }
+                true
+            } ?: false
+        }.getOrDefault(false)
+        if (!ok) return false
+
+        val files = children.filter { it.mime != DocumentsContract.Document.MIME_TYPE_DIR }
+        val lrcByBase = files.filter { LocalAudioFormats.extensionOf(it.name) == "lrc" }
+            .associateBy { it.name.substringBeforeLast('.').lowercase() }
+        val folderCover = files.firstOrNull { file ->
+            val base = file.name.substringBeforeLast('.').lowercase()
+            val ext = LocalAudioFormats.extensionOf(file.name)
+            base in COVER_NAMES && ext in IMAGE_EXTENSIONS
+        }
+        files.sortedBy { it.name.lowercase() }.forEach { file ->
+            val ext = LocalAudioFormats.extensionOf(file.name)
+            when {
+                LocalAudioFormats.isSupported(file.name) -> out += AudioEntry(
+                    treeUri = tree,
+                    documentId = file.id,
+                    displayName = file.name,
+                    size = file.size,
+                    lrcDocumentId = lrcByBase[file.name.substringBeforeLast('.').lowercase()]?.id,
+                    coverDocumentId = folderCover?.id,
+                )
+                ext in LocalAudioFormats.UNSUPPORTED_AUDIO -> unsupported[ext] = (unsupported[ext] ?: 0) + 1
+            }
+        }
+        _state.value = ImportState.Scanning(out.size)
+        children.filter { it.mime == DocumentsContract.Document.MIME_TYPE_DIR }
+            .sortedBy { it.name.lowercase() }
+            .forEach { dir -> walk(tree, dir.id, depth + 1, out, unsupported) }
+        return true
+    }
+
+    private fun destinationFor(entry: AudioEntry): File {
+        val id = LocalMusicNaming.stableId("${entry.treeUri}|${entry.documentId}")
+        val ext = LocalAudioFormats.extensionOf(entry.displayName)
+        return File(root, "$id.$ext")
+    }
+
+    private fun copyDocument(tree: Uri, documentId: String, dest: File) {
+        val uri = DocumentsContract.buildDocumentUriUsingTree(tree, documentId)
+        val tmp = File(dest.parentFile, dest.name + ".part")
+        context.contentResolver.openInputStream(uri).use { input ->
+            checkNotNull(input) { "Can't open $documentId" }
+            tmp.outputStream().use { output -> input.copyTo(output, COPY_BUFFER) }
+        }
+        if (dest.exists()) dest.delete()
+        check(tmp.renameTo(dest)) { "Can't finalize ${dest.name}" }
+    }
+
+    private fun readTrack(file: File, entry: AudioEntry): GeneratedTrack {
+        var title: String? = null
+        var artist: String? = null
+        var album: String? = null
+        var artwork: String? = null
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(file.absolutePath)
+            title = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)?.trim()?.takeIf { it.isNotEmpty() }
+            artist = (retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)
+                ?: retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUMARTIST))
+                ?.trim()?.takeIf { it.isNotEmpty() }
+            album = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM)?.trim()?.takeIf { it.isNotEmpty() }
+            retriever.embeddedPicture?.takeIf { it.isNotEmpty() }?.let { bytes ->
+                val art = File(artDir, LocalMusicNaming.stableId(bytes) + ".img")
+                if (!art.exists()) art.writeBytes(bytes)
+                artwork = Uri.fromFile(art).toString()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "No readable tags in ${entry.displayName}", e)
+        } finally {
+            runCatching { retriever.release() }
+        }
+        if (artwork == null && entry.coverDocumentId != null) {
+            val art = File(artDir, LocalMusicNaming.stableId("${entry.treeUri}|${entry.coverDocumentId}") + ".img")
+            if (art.exists() || runCatching { copyDocument(entry.treeUri, entry.coverDocumentId, art) }.isSuccess) {
+                artwork = Uri.fromFile(art).toString()
+            }
+        }
+        val fallback = LocalMusicNaming.fromFileName(entry.displayName)
+        return GeneratedTrack(
+            name = title ?: fallback.title,
+            artist = artist ?: fallback.artist ?: UNKNOWN_ARTIST,
+            album = album,
+            artworkUrl = artwork,
+            url = file.absolutePath,
+        )
+    }
+
+    /**
+     * Deletes copied files no playlist references any more (after a song was
+     * removed from "Local songs" and every other playlist, or the playlist was
+     * deleted). Waits for a running import so freshly copied files are safe.
+     */
+    fun cleanupOrphansAsync() {
+        scope.launch {
+            mutex.withLock {
+                runCatching { cleanupOrphans() }.onFailure { Log.w(TAG, "Orphan cleanup failed", it) }
+            }
+        }
+    }
+
+    private suspend fun cleanupOrphans() {
+        val playlists = playlistRepository.getAll()
+        // Liked Songs always exists: an empty read means storage failed, and
+        // treating it as "nothing referenced" would wipe every copied song.
+        if (playlists.isEmpty()) return
+        val tracks = playlists.flatMap { it.tracks }
+        val audio = tracks.filter { it.isLocalFile() }.mapTo(mutableSetOf()) { File(it.url).name }
+        val art = tracks.mapNotNull { it.artworkUrl }
+            .filter { it.startsWith("file://") }
+            .mapTo(mutableSetOf()) { Uri.parse(it).lastPathSegment.orEmpty() }
+        root.listFiles()?.forEach { file ->
+            if (!file.isFile) return@forEach
+            val name = file.name
+            val keep = when {
+                name.endsWith(".part") -> false
+                name.endsWith(".lrc") -> audio.any { it.substringBeforeLast('.') == name.substringBeforeLast('.') }
+                else -> name in audio
+            }
+            if (!keep) file.delete()
+        }
+        artDir.listFiles()?.forEach { file -> if (file.name !in art) file.delete() }
+    }
+
+    /** Bytes used by copied songs, covers and lyrics. */
+    fun storageBytes(): Long = root.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+
+    private fun loadFolders(): List<Uri> =
+        prefs.getString(KEY_FOLDERS, null)
+            ?.split('\n')
+            ?.filter { it.isNotBlank() }
+            ?.map(Uri::parse)
+            .orEmpty()
+
+    private fun saveFolders(folders: List<Uri>) {
+        prefs.edit().putString(KEY_FOLDERS, folders.joinToString("\n")).apply()
+        _folders.value = folders
+    }
+
+    companion object {
+        private const val TAG = "LocalMusicLibrary"
+        const val DIR = LocalAudioFormats.IMPORT_DIR
+        private const val ART_DIR = "art"
+        private const val PREFS = "local_music"
+        private const val KEY_FOLDERS = "folders"
+        private const val MAX_DEPTH = 24
+        private const val COPY_BUFFER = 256 * 1024
+        private const val SPACE_MARGIN_BYTES = 200L * 1024 * 1024
+        const val UNKNOWN_ARTIST = "Unknown artist"
+        private val COVER_NAMES = setOf("cover", "folder", "front", "album", "albumart")
+        private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp")
+    }
+}
+
+/** Pure helpers (unit-tested). */
+object LocalMusicNaming {
+    data class Names(val title: String, val artist: String?)
+
+    /**
+     * Fallback when a file has no tags: "01 - Artist - Title.flac" ->
+     * (Title, Artist); "Artist - Title.mp3" -> (Title, Artist); else the
+     * bare file name as title. A leading track number is dropped.
+     */
+    fun fromFileName(fileName: String): Names {
+        val base = fileName.substringAfterLast('/').substringBeforeLast('.').trim()
+        val withoutNumber = base.replace(LEADING_TRACK_NUMBER, "").trim().ifEmpty { base }
+        val parts = withoutNumber.split(" - ").map { it.trim() }.filter { it.isNotEmpty() }
+        return if (parts.size >= 2) {
+            Names(title = parts.drop(1).joinToString(" - "), artist = parts.first())
+        } else {
+            Names(title = withoutNumber, artist = null)
+        }
+    }
+
+    fun stableId(key: String): String = stableId(key.toByteArray(Charsets.UTF_8))
+
+    fun stableId(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-1").digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+            .take(24)
+
+    private val LEADING_TRACK_NUMBER = Regex("^\\d{1,3}\\s*[-._)]?\\s+")
+}

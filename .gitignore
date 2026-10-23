@@ -1,0 +1,98 @@
+# Built application files
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# Files for the ART/Dalvik VM
+*.dex
+
+# Java and Python compiled files
+*.class
+__pycache__/
+*.pyc
+
+# Generated build files
+build/
+**/build/
+.gradle/
+
+# Android Studio / IntelliJ IDEA
+.idea/
+*.iml
+.navigation/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Local configuration file (contains SDK location, private tokens)
+local.properties
+
+# Log files
+*.log
+
+# Keystore files
+*.jks
+*.keystore
+*.p12
+*.pem
+
+# OS & Tooling
+.DS_Store
+Thumbs.db
+.acside/
+.codex/
+.codex*
+*.codex
+*.codex*
+*.pid
+
+# Credentials & Environment
+Screenshot/release.jks
+keystore_credentials.txt
+.env
+.wrangler/
+.gradle_home/
+# Bundled provider modules (.lwp packages)
+app/src/main/assets/modules/
+*.lwp
+tools/*
+!tools/generate_native_secrets.py
+provider.js
+# Single raw provider source at repo base only (plaintext JSON, encrypted at build)
+provider.json
+# Local Kotlin daemon state
+.kotlin/
+# Native generated secrets (CI only, never commit)
+app/src/main/cpp/SecretsBridge_generated.h
+
+
+# Addon service & credentials (never commit)
+nlxmusic-addon-service/
+*.zip
+credentials_backup*
+
+# Isolated git worktrees (never commit their contents)
+.worktrees/
+
+# Standalone Telemetry Repository (separated to notlae/Nlx_music--Telemetry)
+nlxmusic-live/
+
+# Standalone Jam Sync Repository (separated to notlae/Nlx_music--Jam)
+nlxmusic-jam/
+
+
+# Temporary and generated files
+.glance_temp/
+.gradle/
+**/build/
+local.properties
+
+# Local secrets and signing files
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+
+.glance_temp/
