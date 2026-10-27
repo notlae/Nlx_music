@@ -65,6 +65,6 @@ See the [LICENSE](LICENSE) file in this repository for the project's license and
 
 ## Links
 
-- **Portfolio:** https://notlae.netlify.app
+- **Portfolio:** https://notlae.is-a.dev
 - **GitHub repository:** https://github.com/notlae/Nlx_music
 - **Instagram:** https://www.instagram.com/biren_shrestha17
